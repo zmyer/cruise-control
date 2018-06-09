@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantLock;
@@ -47,7 +48,7 @@ import org.slf4j.LoggerFactory;
  *   </ul>
  *   The validity of an entity is determined by its validity in all the windows. An entity is considered as invalid
  *   if there is an invalid window or there are too many windows with extrapolations.
- * </p>
+ *
  * <p>
  *   Furthermore, each entity belongs to an aggregation entity group. The aggregation entity group is only used
  *   for metric aggregation purpose. Users can specify the {@link AggregationOptions.Granularity} of the metric aggregation. The
@@ -64,7 +65,7 @@ import org.slf4j.LoggerFactory;
  *       the entities in the same aggregation entity group.
  *     </li>
  *   </ul>
- * </p>
+ *
  * <p>
  *   From per window's perspective, for each window, there is a given set of <tt>valid</tt> entities and entity
  *   groups as described above. The validity of a window depends on the requirements specified in the
@@ -244,7 +245,12 @@ public class MetricSampleAggregator<G, E extends Entity<G>> extends LongGenerati
     _windowRollingLock.lock();
     try {
       Map<E, ValuesAndExtrapolations> result = new HashMap<>();
-      _rawMetrics.forEach((entity, rawMetric) -> result.put(entity, rawMetric.peekCurrentWindow(_currentWindowIndex, _metricDef)));
+      _rawMetrics.forEach((entity, rawMetric) -> {
+        ValuesAndExtrapolations vae = rawMetric.peekCurrentWindow(_currentWindowIndex, _metricDef);
+        SortedSet<Long> currentWindows = new TreeSet<>(Collections.singleton(_currentWindowIndex));
+        vae.setWindows(toWindows(currentWindows));
+        result.put(entity, vae);
+      });
       return result;
     } finally {
       _windowRollingLock.unlock();
