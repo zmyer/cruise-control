@@ -5,31 +5,38 @@
 package com.linkedin.kafka.cruisecontrol.async;
 
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControl;
+import com.linkedin.kafka.cruisecontrol.servlet.parameters.PartitionLoadParameters;
+import com.linkedin.kafka.cruisecontrol.servlet.response.PartitionLoadState;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
-import com.linkedin.kafka.cruisecontrol.monitor.ModelCompletenessRequirements;
 
 /**
- * The async runnable for {@link KafkaCruiseControl#clusterModel(long, long, ModelCompletenessRequirements,
- * com.linkedin.kafka.cruisecontrol.async.progress.OperationProgress)}
+ * The async runnable for {@link KafkaCruiseControl#clusterModel(long, long, Double,
+ * com.linkedin.kafka.cruisecontrol.async.progress.OperationProgress, boolean)}
  */
-class GetClusterModelInRangeRunnable extends OperationRunnable<ClusterModel> {
-  private final long _startMs;
-  private final long _endMs;
-  private final ModelCompletenessRequirements _modelCompletenessRequirements;
-  
+class GetClusterModelInRangeRunnable extends OperationRunnable {
+  private final PartitionLoadParameters _parameters;
+
   GetClusterModelInRangeRunnable(KafkaCruiseControl kafkaCruiseControl,
-                                 OperationFuture<ClusterModel> future,
-                                 long startMs,
-                                 long endMs,
-                                 ModelCompletenessRequirements modelCompletenessRequirements) {
+                                 OperationFuture future,
+                                 PartitionLoadParameters parameters) {
     super(kafkaCruiseControl, future);
-    _startMs = startMs;
-    _endMs = endMs;
-    _modelCompletenessRequirements = modelCompletenessRequirements;
+    _parameters = parameters;
   }
 
   @Override
-  protected ClusterModel getResult() throws Exception {
-    return _kafkaCruiseControl.clusterModel(_startMs, _endMs, _modelCompletenessRequirements, _future.operationProgress());
+  protected PartitionLoadState getResult() throws Exception {
+    ClusterModel clusterModel = _kafkaCruiseControl.clusterModel(_parameters.startMs(),
+                                                                 _parameters.endMs(),
+                                                                 _parameters.minValidPartitionRatio(),
+                                                                 _future.operationProgress(),
+                                                                 _parameters.allowCapacityEstimation());
+    int topicNameLength = clusterModel.topics().stream().mapToInt(String::length).max().orElse(20) + 5;
+    return new PartitionLoadState(clusterModel.replicasSortedByUtilization(_parameters.resource()),
+                                  _parameters.wantMaxLoad(),
+                                  _parameters.entries(),
+                                  _parameters.partitionUpperBoundary(),
+                                  _parameters.partitionLowerBoundary(),
+                                  _parameters.topic(),
+                                  topicNameLength);
   }
 }

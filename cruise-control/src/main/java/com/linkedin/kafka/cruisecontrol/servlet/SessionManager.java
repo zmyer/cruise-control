@@ -5,9 +5,12 @@
 package com.linkedin.kafka.cruisecontrol.servlet;
 
 import com.codahale.metrics.Gauge;
+import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.Timer;
 import com.linkedin.kafka.cruisecontrol.async.OperationFuture;
 import com.linkedin.kafka.cruisecontrol.common.KafkaCruiseControlThreadFactory;
+import com.linkedin.kafka.cruisecontrol.servlet.parameters.ParameterUtils;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -49,6 +52,9 @@ public class SessionManager {
       Executors.newSingleThreadScheduledExecutor(new KafkaCruiseControlThreadFactory("SessionCleaner",
                                                                                      true,
                                                                                      null));
+  private final Timer _sessionLifetimeTimer;
+  private final Meter _sessionCreationFailureMeter;
+  private final Map<EndPoint, Timer> _successfulRequestExecutionTimer;
 
   /**
    * Construct the session manager.
@@ -57,12 +63,16 @@ public class SessionManager {
    * @param time the time object for unit test.
    * @param dropwizardMetricRegistry the metric registry to record metrics.
    */
-  SessionManager(int capacity, long sessionExpiryMs, Time time, MetricRegistry dropwizardMetricRegistry) {
+  SessionManager(int capacity, long sessionExpiryMs, Time time, MetricRegistry dropwizardMetricRegistry, Map<EndPoint, Timer> successfulRequestExecutionTimer) {
     _capacity = capacity;
     _sessionExpiryMs = sessionExpiryMs;
     _time = time;
     _inProgressSessions = new HashMap<>();
     _sessionCleaner.scheduleAtFixedRate(new ExpiredSessionCleaner(), 0, 5, TimeUnit.SECONDS);
+    _successfulRequestExecutionTimer = successfulRequestExecutionTimer;
+    // Metrics registration
+    _sessionLifetimeTimer = dropwizardMetricRegistry.timer(MetricRegistry.name("SessionManager", "session-lifetime-timer"));
+    _sessionCreationFailureMeter = dropwizardMetricRegistry.meter(MetricRegistry.name("SessionManager", "session-creation-failure-rate"));
     dropwizardMetricRegistry.register(MetricRegistry.name("SessionManager", "num-active-sessions"),
                                       (Gauge<Integer>) _inProgressSessions::size);
 
@@ -92,9 +102,9 @@ public class SessionManager {
    * @return the {@link OperationFuture} for the provided async operation.
    */
   @SuppressWarnings("unchecked")
-  synchronized <T> OperationFuture<T> getAndCreateSessionIfNotExist(HttpServletRequest request,
-                                                                    Supplier<OperationFuture<T>> operation,
-                                                                    int step) {
+  synchronized OperationFuture getAndCreateSessionIfNotExist(HttpServletRequest request,
+                                                             Supplier<OperationFuture> operation,
+                                                             int step) {
     HttpSession session = request.getSession();
     SessionInfo info = _inProgressSessions.get(session);
     String requestString = toRequestString(request);
@@ -104,11 +114,11 @@ public class SessionManager {
       info.ensureSameRequest(requestString, request.getParameterMap());
       // If there is next future return it.
       if (step < info.numFutures()) {
-        return (OperationFuture<T>) info.future(step);
+        return info.future(step);
       } else if (step == info.numFutures()) {
         LOG.info("Adding new future to existing session {}.", session);
         // if there is no next future, add the future to the next list.
-        OperationFuture<T> future = operation.get();
+        OperationFuture future = operation.get();
         info.addFuture(future);
         return future;
       } else {
@@ -121,12 +131,13 @@ public class SessionManager {
       }
       // The session does not exist, add it.
       if (_inProgressSessions.size() >= _capacity) {
+        _sessionCreationFailureMeter.mark();
         throw new RuntimeException("There are already " + _inProgressSessions.size() + " active sessions, which "
-                                       + "has reached the servlet capacity.");
+                                   + "has reached the servlet capacity.");
       }
       LOG.info("Created session for {}", session);
-      info = new SessionInfo(requestString, request.getParameterMap());
-      OperationFuture<T> future = operation.get();
+      info = new SessionInfo(requestString, request.getParameterMap(), ParameterUtils.endPoint(request));
+      OperationFuture future = operation.get();
       info.addFuture(future);
       _inProgressSessions.put(session, info);
       return future;
@@ -146,7 +157,7 @@ public class SessionManager {
       return null;
     } else if (!info.requestUrl().equals(toRequestString(request))) {
       throw new IllegalStateException("The session has an ongoing operation " + info.requestUrl() + " while it "
-                                         + "is trying another operation of " + toRequestString(request));
+                                      + "is trying another operation of " + toRequestString(request));
     }
     return (T) info.lastFuture();
   }
@@ -154,8 +165,9 @@ public class SessionManager {
   /**
    * Close the session for the given request.
    * @param request the request to close its session.
+   * @param hasError whether the session is closed due to an error or not.
    */
-  synchronized void closeSession(HttpServletRequest request) {
+  synchronized void closeSession(HttpServletRequest request, boolean hasError) {
     // Response associated with this request has already been flushed; hence, do not attempt to create a new session.
     HttpSession session = request.getSession(false);
     if (session == null) {
@@ -165,6 +177,10 @@ public class SessionManager {
     if (info != null && info.lastFuture().isDone()) {
       LOG.info("Closing session {}", session);
       session.invalidate();
+      _sessionLifetimeTimer.update(System.nanoTime() - info.requestStartTimeNs(), TimeUnit.NANOSECONDS);
+      if (!hasError && info.executionTime() > 0) {
+        _successfulRequestExecutionTimer.get(info.endPoint()).update(info.executionTime(), TimeUnit.NANOSECONDS);
+      }
     }
   }
 
@@ -178,13 +194,20 @@ public class SessionManager {
       Map.Entry<HttpSession, SessionInfo> entry = iter.next();
       HttpSession session = entry.getKey();
       SessionInfo info = entry.getValue();
-      LOG.trace("Session {} was last accessed at {}, age is {} ms", session, session.getLastAccessedTime(),
-                now - session.getLastAccessedTime());
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("Session {} was last accessed at {}, age is {} ms", session, session.getLastAccessedTime(),
+                  now - session.getLastAccessedTime());
+      }
       if (now >= session.getLastAccessedTime() + _sessionExpiryMs) {
         LOG.info("Expiring session {}.", session);
         iter.remove();
         session.invalidate();
-        info.lastFuture().cancel(true);
+        _sessionLifetimeTimer.update(System.nanoTime() - info.requestStartTimeNs(), TimeUnit.NANOSECONDS);
+        if (info.lastFuture().isDone() && info.executionTime() > 0) {
+          _successfulRequestExecutionTimer.get(info.endPoint()).update(info.executionTime(), TimeUnit.NANOSECONDS);
+        } else {
+          info.lastFuture().cancel(true);
+        }
       }
     }
   }
@@ -196,11 +219,15 @@ public class SessionManager {
     private final String _requestUrl;
     private final Map<String, String[]> _requestParameters;
     private final List<OperationFuture> _operationFuture;
+    private final long _requestStartTimeNs;
+    private final EndPoint _endPoint;
 
-    private SessionInfo(String requestUrl, Map<String, String[]> requestParameters) {
+    private SessionInfo(String requestUrl, Map<String, String[]> requestParameters, EndPoint endPoint) {
       _operationFuture = new ArrayList<>();
       _requestUrl = requestUrl;
       _requestParameters = requestParameters;
+      _requestStartTimeNs = System.nanoTime();
+      _endPoint = endPoint;
     }
 
     private int numFutures() {
@@ -223,6 +250,18 @@ public class SessionManager {
       return _requestUrl;
     }
 
+    private long requestStartTimeNs() {
+      return _requestStartTimeNs;
+    }
+
+    private long executionTime() {
+      return lastFuture().finishTimeNs() == -1 ? -1 : lastFuture().finishTimeNs() - _requestStartTimeNs;
+    }
+
+    private EndPoint endPoint() {
+      return _endPoint;
+    }
+
     private boolean paramEquals(Map<String, String[]> parameters) {
       boolean isSameParameters = _requestParameters.keySet().equals(parameters.keySet());
       if (isSameParameters) {
@@ -241,7 +280,7 @@ public class SessionManager {
       if (!_requestUrl.equals(requestUrl) || !paramEquals(parameters)) {
         throw new IllegalStateException(String.format(
             "The session has an ongoing operation [URL: %s, Parameters: %s] "
-                + "while it is trying another operation of [URL: %s, Parameters: %s].",
+            + "while it is trying another operation of [URL: %s, Parameters: %s].",
             _requestUrl, _requestParameters, requestUrl, parameters));
       }
     }

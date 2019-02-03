@@ -20,10 +20,20 @@ import java.util.Map;
 public class BrokerFailures extends KafkaAnomaly {
   private final KafkaCruiseControl _kafkaCruiseControl;
   private final Map<Integer, Long> _failedBrokers;
+  private final boolean _allowCapacityEstimation;
+  private final boolean _excludeRecentlyDemotedBrokers;
+  private final boolean _excludeRecentlyRemovedBrokers;
 
-  public BrokerFailures(KafkaCruiseControl kafkaCruiseControl, Map<Integer, Long> failedBrokers) {
+  public BrokerFailures(KafkaCruiseControl kafkaCruiseControl,
+                        Map<Integer, Long> failedBrokers,
+                        boolean allowCapacityEstimation,
+                        boolean excludeRecentlyDemotedBrokers,
+                        boolean excludeRecentlyRemovedBrokers) {
     _kafkaCruiseControl = kafkaCruiseControl;
     _failedBrokers = failedBrokers;
+    _allowCapacityEstimation = allowCapacityEstimation;
+    _excludeRecentlyDemotedBrokers = excludeRecentlyDemotedBrokers;
+    _excludeRecentlyRemovedBrokers = excludeRecentlyRemovedBrokers;
   }
 
   /**
@@ -35,10 +45,13 @@ public class BrokerFailures extends KafkaAnomaly {
 
   @Override
   public void fix() throws KafkaCruiseControlException {
-    // Fix the cluster by removing the failed brokers.
+    // Fix the cluster by removing the failed brokers (mode: non-Kafka_assigner).
     if (_failedBrokers != null && !_failedBrokers.isEmpty()) {
       _kafkaCruiseControl.decommissionBrokers(_failedBrokers.keySet(), false, false,
-                                             Collections.emptyList(), null, new OperationProgress());
+                                             Collections.emptyList(), null, new OperationProgress(),
+                                              _allowCapacityEstimation, null, null,
+                                              false, null, null,
+                                              _excludeRecentlyDemotedBrokers, _excludeRecentlyRemovedBrokers);
     }
   }
 

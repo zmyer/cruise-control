@@ -6,7 +6,7 @@ package com.linkedin.kafka.cruisecontrol.detector;
 
 import com.linkedin.cruisecontrol.detector.Anomaly;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControl;
-import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlState;
+import com.linkedin.kafka.cruisecontrol.servlet.response.CruiseControlState;
 import com.linkedin.kafka.cruisecontrol.async.progress.OperationProgress;
 import com.linkedin.kafka.cruisecontrol.common.KafkaCruiseControlThreadFactory;
 import com.linkedin.kafka.cruisecontrol.detector.notifier.AnomalyNotificationResult;
@@ -72,8 +72,9 @@ public class AnomalyDetectorTest {
     EasyMock.expect(mockDetectorScheduler.isTerminated()).andDelegateTo(executorService);
 
     // The following state are used to test the delayed check when executor is busy.
-    EasyMock.expect(mockKafkaCruiseControl.state(EasyMock.anyObject()))
-            .andReturn(new KafkaCruiseControlState(ExecutorState.noTaskInProgress(), null, null));
+    EasyMock.expect(mockKafkaCruiseControl.state(EasyMock.anyObject(), EasyMock.anyObject()))
+            .andReturn(new CruiseControlState(ExecutorState.noTaskInProgress(null, null), null, null,
+                                              null));
 
     EasyMock.replay(mockAnomalyNotifier);
     EasyMock.replay(mockBrokerFailureDetector);
@@ -89,7 +90,8 @@ public class AnomalyDetectorTest {
 
     try {
       anomalyDetector.startDetection();
-      anomalies.add(new BrokerFailures(mockKafkaCruiseControl, Collections.singletonMap(0, 100L)));
+      anomalies.add(new BrokerFailures(mockKafkaCruiseControl, Collections.singletonMap(0, 100L),
+                                       false, true, true));
       while (!anomalies.isEmpty()) {
         // just wait for the anomalies to be drained.
       }
@@ -139,12 +141,21 @@ public class AnomalyDetectorTest {
     EasyMock.expect(mockDetectorScheduler.isTerminated()).andDelegateTo(executorService);
 
     // The following state are used to test the delayed check when executor is busy.
-    EasyMock.expect(mockKafkaCruiseControl.state(EasyMock.anyObject()))
-            .andReturn(new KafkaCruiseControlState(ExecutorState.noTaskInProgress(), null, null));
+    EasyMock.expect(mockKafkaCruiseControl.state(EasyMock.anyObject(), EasyMock.anyObject()))
+            .andReturn(new CruiseControlState(ExecutorState.noTaskInProgress(null, null), null, null,
+                                              null));
     EasyMock.expect(mockKafkaCruiseControl.rebalance(EasyMock.eq(Collections.emptyList()),
                                                      EasyMock.eq(false),
                                                      EasyMock.eq(null),
-                                                     EasyMock.anyObject(OperationProgress.class)))
+                                                     EasyMock.anyObject(OperationProgress.class),
+                                                     EasyMock.eq(true),
+                                                     EasyMock.eq(null),
+                                                     EasyMock.eq(null),
+                                                     EasyMock.eq(false),
+                                                     EasyMock.eq(null),
+                                                     EasyMock.eq(null),
+                                                     EasyMock.eq(true),
+                                                     EasyMock.eq(true)))
             .andReturn(null);
     EasyMock.expect(mockKafkaCruiseControl.meetCompletenessRequirements(EasyMock.anyObject())).andReturn(true);
 
@@ -162,7 +173,10 @@ public class AnomalyDetectorTest {
 
     try {
       anomalyDetector.startDetection();
-      anomalies.add(new GoalViolations(mockKafkaCruiseControl));
+      GoalViolations violations = new GoalViolations(mockKafkaCruiseControl, true,
+                                                     true, true);
+      violations.addViolation("RackAwareGoal", true);
+      anomalies.add(violations);
       while (!anomalies.isEmpty()) {
         // Just wait for the anomalies to be drained.
       }
@@ -209,8 +223,8 @@ public class AnomalyDetectorTest {
     EasyMock.expect(mockDetectorScheduler.isTerminated()).andDelegateTo(executorService);
 
     // The following state are used to test the delayed check when executor is busy.
-    EasyMock.expect(mockKafkaCruiseControl.state(EasyMock.anyObject()))
-            .andReturn(new KafkaCruiseControlState(
+    EasyMock.expect(mockKafkaCruiseControl.state(EasyMock.anyObject(), EasyMock.anyObject()))
+            .andReturn(new CruiseControlState(
                 ExecutorState.replicaMovementInProgress(1,
                                                         Collections.emptySet(),
                                                         Collections.emptySet(),
@@ -218,8 +232,13 @@ public class AnomalyDetectorTest {
                                                         Collections.emptySet(),
                                                         Collections.emptySet(),
                                                         1L,
-                                                        1),
-                null, null));
+                                                        1,
+                                                        1,
+                                                        1,
+                                                        null,
+                                                        null,
+                                                        null),
+                null, null, null));
 
     EasyMock.replay(mockAnomalyNotifier);
     EasyMock.replay(mockBrokerFailureDetector);
@@ -235,7 +254,8 @@ public class AnomalyDetectorTest {
 
     try {
       anomalyDetector.startDetection();
-      anomalies.add(new GoalViolations(mockKafkaCruiseControl));
+      anomalies.add(new GoalViolations(mockKafkaCruiseControl, true,
+                                       true, true));
       while (!anomalies.isEmpty()) {
         // Just wait for the anomalies to be drained.
       }
@@ -269,7 +289,4 @@ public class AnomalyDetectorTest {
     t.join(30000L);
     assertTrue(detectorScheduler.isTerminated());
   }
-
-
-
 }

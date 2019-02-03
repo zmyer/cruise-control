@@ -45,6 +45,9 @@ public class LoadMonitorTaskRunner {
 
   private AtomicReference<LoadMonitorTaskRunnerState> _state;
   private volatile double _bootstrapProgress;
+  private volatile boolean _awaitingPauseSampling;
+  // The reason for pausing or resuming metric sampling.
+  private volatile String _reasonOfLatestPauseOrResume;
 
   public enum LoadMonitorTaskRunnerState {
     NOT_STARTED, RUNNING, PAUSED, SAMPLING, BOOTSTRAPPING, TRAINING, LOADING
@@ -109,6 +112,8 @@ public class LoadMonitorTaskRunner {
 
     _state = new AtomicReference<>(NOT_STARTED);
     _bootstrapProgress = -1.0;
+    _awaitingPauseSampling = false;
+    _reasonOfLatestPauseOrResume = null;
   }
 
   /**
@@ -199,7 +204,8 @@ public class LoadMonitorTaskRunner {
    */
   public void train(long startMs, long endMs) {
     if (_state.compareAndSet(RUNNING, TRAINING)) {
-      _samplingScheduler.submit(new TrainingTask(_time, this, _metricFetcherManager, _sampleStore, _configuredWindowMs, _samplingIntervalMs, startMs, endMs));
+      _samplingScheduler.submit(new TrainingTask(_time, this, _metricFetcherManager, _sampleStore,
+                                                 _configuredWindowMs, _samplingIntervalMs, startMs, endMs));
     } else {
       throw new IllegalStateException("Cannot start model training because the load monitor is in "
                                           + _state.get() + " state.");
@@ -261,22 +267,41 @@ public class LoadMonitorTaskRunner {
 
   /**
    * Pause the scheduled sampling tasks..
+   *
+   * @param reason The reason for pausing metric sampling.
    */
-  public void pauseSampling() {
+  public synchronized void pauseSampling(String reason) {
     if (_state.get() != PAUSED && !_state.compareAndSet(RUNNING, PAUSED)) {
+      _awaitingPauseSampling = true;
       throw new IllegalStateException("Cannot pause the load monitor because it is in " + _state.get() + " state.");
+    } else {
+      _awaitingPauseSampling = false;
+      _reasonOfLatestPauseOrResume = reason;
     }
   }
 
   /**
    * Resume the scheduled sampling tasks.
+   *
+   * @param reason The reason for resuming metric sampling.
    */
-  public void resumeSampling() {
+  public synchronized void resumeSampling(String reason) {
     if (_state.get() != RUNNING && !_state.compareAndSet(PAUSED, RUNNING)) {
       throw new IllegalStateException("Cannot resume the load monitor because it is in " + _state.get() + " state");
     }
+    _reasonOfLatestPauseOrResume = reason;
   }
 
+  public String reasonOfLatestPauseOrResume() {
+    return _reasonOfLatestPauseOrResume;
+  }
+
+  /**
+   * Allow tasks to know if another thread, e.g. executor, is waiting on sampling to pause.
+   */
+  public boolean awaitingPauseSampling() {
+    return _awaitingPauseSampling;
+  }
 
   boolean compareAndSetState(LoadMonitorTaskRunnerState expectedState, LoadMonitorTaskRunnerState newState) {
     return _state.compareAndSet(expectedState, newState);

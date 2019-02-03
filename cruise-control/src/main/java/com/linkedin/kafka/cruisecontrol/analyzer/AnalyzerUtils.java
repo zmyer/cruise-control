@@ -7,20 +7,17 @@ package com.linkedin.kafka.cruisecontrol.analyzer;
 import com.linkedin.kafka.cruisecontrol.common.Resource;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.Goal;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
-import com.linkedin.kafka.cruisecontrol.common.Statistic;
 import com.linkedin.kafka.cruisecontrol.exception.OptimizationFailureException;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutionProposal;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
-import com.linkedin.kafka.cruisecontrol.model.ClusterModelStats;
 
 import com.linkedin.kafka.cruisecontrol.model.RawAndDerivedResource;
 import com.linkedin.kafka.cruisecontrol.model.Replica;
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.SortedMap;
 import java.util.TreeMap;
 
 import org.apache.commons.math3.random.MersenneTwister;
@@ -35,7 +32,14 @@ import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.ACCEPT;
  * A util class for Analyzer.
  */
 public class AnalyzerUtils {
-  public final static double EPSILON = 1E-5;
+  public static final String BROKERS = "brokers";
+  public static final String REPLICAS = "replicas";
+  public static final String TOPICS = "topics";
+  public static final String METADATA = "metadata";
+  public static final String POTENTIAL_NW_OUT = "potentialNwOut";
+  public static final String TOPIC_REPLICAS = "topicReplicas";
+  public static final String STATISTICS = "statistics";
+  public static final double EPSILON = 1E-5;
 
   private AnalyzerUtils() {
 
@@ -128,45 +132,6 @@ public class AnalyzerUtils {
     }
   }
 
-  /*
-   * Return an object that can be further used
-   * to encode into JSON
-   *
-   * @param clusterModelStats Cluster model stats.
-   */
-  public static Map<String, Object> getJsonStructure(ClusterModelStats clusterModelStats) {
-    Map<String, Object> clusterStatsMap = new HashMap<>();
-
-    clusterStatsMap.put("brokers", clusterModelStats.numBrokers());
-    clusterStatsMap.put("replicas", clusterModelStats.numReplicasInCluster());
-    clusterStatsMap.put("topics", clusterModelStats.numTopics());
-
-    Map<Statistic, Map<Resource, Double>> resourceUtilizationStats = clusterModelStats.resourceUtilizationStats();
-    Map<Statistic, Double> nwOutUtilizationStats = clusterModelStats.potentialNwOutUtilizationStats();
-    Map<Statistic, Number> replicaStats = clusterModelStats.replicaStats();
-    Map<Statistic, Number> topicReplicaStats = clusterModelStats.topicReplicaStats();
-
-    Map<String, Object> statisticMap = new HashMap<>();
-
-    for (Statistic stat : Statistic.values()) {
-      Map<String, Double> resourceMap = new HashMap<>();
-
-      for (Resource resource : Resource.cachedValues()) {
-        resourceMap.put(resource.resource(), resourceUtilizationStats.get(stat).get(resource));
-      }
-
-      resourceMap.put("potentialNwOut", nwOutUtilizationStats.get(stat));
-      resourceMap.put("replicas", replicaStats.get(stat).doubleValue());
-      resourceMap.put("topicReplicas",  topicReplicaStats.get(stat).doubleValue());
-
-      statisticMap.put(stat.stat(), resourceMap);
-    }
-
-    clusterStatsMap.put("statistics", statisticMap);
-
-    return clusterStatsMap;
-  }
-
   /**
    * Compare the given values. Return 1 if first &gt; second, -1 if first &lt; second, 0 otherwise.
    *
@@ -199,24 +164,10 @@ public class AnalyzerUtils {
   }
 
   /**
-   * Get a priority to goal mapping. This is a default mapping.
+   * Get an list of goals sorted by highest to lowest default priority.
    */
-  public static SortedMap<Integer, Goal> getGoalMapByPriority(KafkaCruiseControlConfig config) {
-    List<String> defaultGoalsConfig = config.getList(KafkaCruiseControlConfig.DEFAULT_GOALS_CONFIG);
-    List<Goal> goals;
-    if (defaultGoalsConfig == null || defaultGoalsConfig.isEmpty()) {
-      // Default goals config not set or it is empty, use all the goals.
-      goals = config.getConfiguredInstances(KafkaCruiseControlConfig.GOALS_CONFIG, Goal.class);
-    } else {
-      // Use the provided default goals config.
-      goals = config.getConfiguredInstances(KafkaCruiseControlConfig.DEFAULT_GOALS_CONFIG, Goal.class);
-    }
-    SortedMap<Integer, Goal> orderedGoals = new TreeMap<>();
-    int i = 0;
-    for (Goal goal: goals) {
-      orderedGoals.put(i++, goal);
-    }
-    return orderedGoals;
+  public static List<Goal> getGoalMapByPriority(KafkaCruiseControlConfig config) {
+    return config.getConfiguredInstances(KafkaCruiseControlConfig.DEFAULT_GOALS_CONFIG, Goal.class);
   }
 
   /**
@@ -294,4 +245,33 @@ public class AnalyzerUtils {
     }
   }
 
+  /**
+   * Get all permutations of the given list of goals to permute.
+   *
+   * @param toPermute List of goals to permute.
+   * @return A set containing all possible permutations of the given list of goals to permute.
+   */
+  public static Set<List<Goal>> getPermutations(List<Goal> toPermute) {
+    Set<List<Goal>> allPermutations = new HashSet<>();
+    // Handle the case with single goal to permute.
+    if (toPermute.size() == 1) {
+      allPermutations.add(toPermute);
+      return allPermutations;
+    }
+
+    for (int i = 0; i < toPermute.size(); i++) {
+      // Copy the original list and remove the goal that we will prepend to the permutations of the remaining goals.
+      List<Goal> remainingToPermute = new ArrayList<>(toPermute);
+      Goal goal = toPermute.get(i);
+      remainingToPermute.remove(i);
+
+      // Prepend the goal to permutations of the remaining goals.
+      for (List<Goal> permutedRemaining: getPermutations(remainingToPermute)) {
+        permutedRemaining.add(0, goal);
+        allPermutations.add(permutedRemaining);
+      }
+    }
+
+    return allPermutations;
+  }
 }

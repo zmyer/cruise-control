@@ -21,6 +21,7 @@ import com.linkedin.kafka.cruisecontrol.analyzer.goals.ReplicaDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.TopicReplicaDistributionGoal;
 import com.linkedin.kafka.cruisecontrol.detector.NoopMetricAnomalyFinder;
 import com.linkedin.kafka.cruisecontrol.detector.notifier.NoopNotifier;
+import com.linkedin.kafka.cruisecontrol.executor.strategy.BaseReplicaMovementStrategy;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.CruiseControlMetricsReporterSampler;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.DefaultMetricSamplerPartitionAssignor;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.KafkaSampleStore;
@@ -28,6 +29,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.StringJoiner;
 import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.common.config.AbstractConfig;
 import org.apache.kafka.common.config.ConfigDef;
@@ -133,9 +135,9 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
       + "maintain.";
 
   /**
-   * <code>broker.metrics.windows.ms</code>
+   * <code>broker.metrics.window.ms</code>
    */
-  public static final String BROKER_METRICS_WINDOW_MS_CONFIG = "broker.metrics.windows.ms";
+  public static final String BROKER_METRICS_WINDOW_MS_CONFIG = "broker.metrics.window.ms";
   private static final String BROKER_METRICS_WINDOW_MS_DOC = "The size of the window in milliseconds to aggregate the"
       + " Kafka broker metrics.";
 
@@ -177,6 +179,13 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
    */
   public static final String NUM_METRIC_FETCHERS_CONFIG = "num.metric.fetchers";
   private static final String NUM_METRIC_FETCHERS_DOC = "The number of metric fetchers to fetch from the Kafka cluster.";
+
+  /**
+   * <code>num.cached.recent.anomaly.states</code>
+   */
+  public static final String NUM_CACHED_RECENT_ANOMALY_STATES_CONFIG = "num.cached.recent.anomaly.states";
+  public static final String NUM_CACHED_RECENT_ANOMALY_STATES_DOC = "The number of recent anomaly states cached for "
+      + "different anomaly types presented via the anomaly substate response of the state endpoint.";
 
   /**
    * <code>metric.sampler.class</code>
@@ -431,6 +440,13 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
       "will also reduce the controller burden.";
 
   /**
+   * <code>execution.task.strategy</code>
+   */
+  public static final String REPLICA_MOVEMENT_STRATEGIES_CONFIG = "replica.movement.strategies";
+  private static final String REPLICA_MOVEMENT_STRATEGIES_DOC = "A list of strategies used to determine execution order for "
+      + "generated partition movement tasks.";
+
+  /**
    * <code>execution.progress.check.interval.ms</code>
    */
   public static final String EXECUTION_PROGRESS_CHECK_INTERVAL_MS_CONFIG = "execution.progress.check.interval.ms";
@@ -445,7 +461,14 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
       + "priority goals will be executed first.";
 
   /**
-   * <code>default.gaols</code>
+   * <code>hard.goals</code>
+   */
+  public static final String HARD_GOALS_CONFIG = "hard.goals";
+  private static final String HARD_GOALS_DOC = "A list of case insensitive hard goals. Hard goals will be enforced to execute "
+      + "if Cruise Control runs in non-kafka-assigner mode and skip_hard_goal_check parameter is not set in request.";
+
+  /**
+   * <code>default.goals</code>
    */
   public static final String DEFAULT_GOALS_CONFIG = "default.goals";
   private static final String DEFAULT_GOALS_DOC = "The list of goals that will be used by default if no goal list "
@@ -457,7 +480,7 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
    */
   public static final String ANOMALY_NOTIFIER_CLASS_CONFIG = "anomaly.notifier.class";
   private static final String ANOMALY_NOTIFIER_CLASS_DOC = "The notifier class to trigger an alert when an "
-      + "anomaly is violated. The anomaly could be either a goal violation or a broker failure.";
+      + "anomaly is violated. The anomaly could be either a goal violation, broker failure, or metric anomaly.";
 
   /**
    * <code>anomaly.detection.interval.ms</code>
@@ -465,6 +488,13 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
   public static final String ANOMALY_DETECTION_INTERVAL_MS_CONFIG = "anomaly.detection.interval.ms";
   private static final String ANOMALY_DETECTION_INTERVAL_MS_DOC = "The interval in millisecond that the detectors will "
       + "run to detect the anomalies.";
+
+  /**
+   * <code>anomaly.detection.allow.capacity.estimation</code>
+   */
+  public static final String ANOMALY_DETECTION_ALLOW_CAPACITY_ESTIMATION_CONFIG = "anomaly.detection.allow.capacity.estimation";
+  private static final String ANOMALY_DETECTION_ALLOW_CAPACITY_ESTIMATION_DOC = "The flag to indicate whether anomaly "
+      + "detection threads allow capacity estimation in the generated cluster model they use.";
 
   /**
    * <code>anomaly.detection.goals</code>
@@ -495,13 +525,174 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
       + "partition movement. It is a regex. Notice that this regex will be ignored when decommission a broker is invoked.";
 
 
+  /**
+   * <code>sample.store.class</code>
+   */
   public static final String SAMPLE_STORE_CLASS_CONFIG = "sample.store.class";
   private static final String SAMPLE_STORE_CLASS_DOC = "The sample store class name. User may configure a sample store "
       + "that persist the metric samples that have already been aggregated into Kafka Cruise Control. Later on the "
       + "persisted samples can be reloaded from the sample store to Kafka Cruise Control.";
 
+  /**
+   * <code>completed.user.task.retention.time.ms</code>
+   */
+  public static final String COMPLETED_USER_TASK_RETENTION_TIME_MS_CONFIG = "completed.user.task.retention.time.ms";
+  private static final String COMPLETED_USER_TASK_RETENTION_TIME_MS_DOC = "The maximum time in milliseconds to store the"
+      + " response and access details of a completed user task.";
+
+  /**
+   * <code>demotion.history.retention.time.ms</code>
+   */
+  public static final String DEMOTION_HISTORY_RETENTION_TIME_MS_CONFIG = "demotion.history.retention.time.ms";
+  private static final String DEMOTION_HISTORY_RETENTION_TIME_MS_DOC = "The maximum time in milliseconds to retain the"
+      + " demotion history of brokers.";
+
+  /**
+   * <code>removal.history.retention.time.ms</code>
+   */
+  public static final String REMOVAL_HISTORY_RETENTION_TIME_MS_CONFIG = "removal.history.retention.time.ms";
+  private static final String REMOVAL_HISTORY_RETENTION_TIME_MS_DOC = "The maximum time in milliseconds to retain the"
+      + " removal history of brokers.";
+
+  /**
+   * <code>max.cached.completed.user.tasks</code>
+   */
+  public static final String MAX_CACHED_COMPLETED_USER_TASKS_CONFIG = "max.cached.completed.user.tasks";
+  private static final String MAX_CACHED_COMPLETED_USER_TASKS_DOC = "The maximum number of completed user tasks for "
+      + "which the response and access details will be cached.";
+
+  /**
+   * <code>max.active.user.tasks</code>
+   */
+  public static final String MAX_ACTIVE_USER_TASKS_CONFIG = "max.active.user.tasks";
+  private static final String MAX_ACTIVE_USER_TASKS_DOC = "The maximum number of user tasks for concurrently running in "
+       + "async endpoints across all users.";
+
+  // Web Server Configurations
+  /**
+   * <code>webserver.http.port</code>
+   */
+  public static final String WEBSERVER_HTTP_PORT_CONFIG = "webserver.http.port";
+  private static final String WEBSERVER_HTTP_PORT_DOC = "Cruise Control Webserver bind port.";
+
+  /**
+   * <code>webserver.http.address</code>
+   */
+  public static final String WEBSERVER_HTTP_ADDRESS_CONFIG = "webserver.http.address";
+  private static final String WEBSERVER_HTTP_ADDRESS_DOC = "Cruise Control Webserver bind ip address.";
+
+  /**
+   * <code>webserver.http.cors.enabled</code>
+   */
+  public static final String WEBSERVER_HTTP_CORS_ENABLED_CONFIG = "webserver.http.cors.enabled";
+  private static final String WEBSERVER_HTTP_CORS_ENABLED_DOC = "CORS enablement flag. true if enabled, false otherwise";
+
+  /**
+   * <code>webserver.http.cors.origin</code>
+   */
+  public static final String WEBSERVER_HTTP_CORS_ORIGIN_CONFIG = "webserver.http.cors.origin";
+  private static final String WEBSERVER_HTTP_CORS_ORIGIN_DOC = "Value for the Access-Control-Allow-Origin header.";
+
+  /**
+   * <code>webserver.http.cors.allowmethods</code>
+   */
+  public static final String WEBSERVER_HTTP_CORS_ALLOWMETHODS_CONFIG = "webserver.http.cors.allowmethods";
+  private static final String WEBSERVER_HTTP_CORS_ALLOWMETHODS_DOC = "Value for the Access-Control-Request-Method header.";
+
+  /**
+   * <code>webserver.http.cors.exposeheaders</code>
+   */
+  public static final String WEBSERVER_HTTP_CORS_EXPOSEHEADERS_CONFIG = "webserver.http.cors.exposeheaders";
+  private static final String WEBSERVER_HTTP_CORS_EXPOSEHEADERS_DOC = "Value for the Access-Control-Expose-Headers header.";
+
+  /**
+   * <code>webserver.api.urlprefix</code>
+   */
+  public static final String WEBSERVER_API_URLPREFIX = "webserver.api.urlprefix";
+  private static final String WEBSERVER_API_URLPREFIX_DOC = "REST API default url prefix";
+
+  /**
+   * <code>webserver.ui.diskpath</code>
+   */
+  public static final String WEBSERVER_UI_DISKPATH = "webserver.ui.diskpath";
+  private static final String WEBSERVER_UI_DISKPATH_DOC = "Location where the Cruise Control frontend is deployed";
+
+  /**
+   * <code>webserver.ui.urlprefix</code>
+   */
+  public static final String WEBSERVER_UI_URLPREFIX = "webserver.ui.urlprefix";
+  private static final String WEBSERVER_UI_URLPREFIX_DOC = "URL Path where UI is served from";
+
+  /**
+   * <code>webserver.request.maxBlockTimeMs</code>
+   */
+  public static final String WEBSERVER_REQUEST_MAX_BLOCK_TIME_MS = "webserver.request.maxBlockTimeMs";
+  private static final String WEBSERVER_REQUEST_MAX_BLOCK_TIME_MS_DOC = "Time after which request is converted to Async";
+
+  /**
+   * <code>webserver.session.maxExpiryTimeMs</code>
+   */
+  public static final String WEBSERVER_SESSION_EXPIRY_MS = "webserver.session.maxExpiryTimeMs";
+  private static final String WEBSERVER_SESSION_EXPIRY_MS_DOC = "Default Session Expiry Period";
+
+  /**
+   * <code>webserver.session.path</code>
+   */
+  public static final String WEBSERVER_SESSION_PATH = "webserver.session.path";
+  private static final String WEBSERVER_SESSION_PATH_DOC = "Default Session Path (for cookies)";
+
+  /**
+   * <code>webserver.accesslog.enabled</code>
+   */
+  public static final String WEBSERVER_ACCESSLOG_ENABLED = "webserver.accesslog.enabled";
+  private static final String WEBSERVER_ACCESSLOG_ENABLED_DOC = "true if access log is enabled";
+
+
+  /**
+   * <code>webserver.accesslog.path</code>
+   */
+  public static final String WEBSERVER_ACCESSLOG_PATH = "webserver.accesslog.path";
+  private static final String WEBSERVER_ACCESSLOG_PATH_DOC = "HTTP Request log path";
+
+  /**
+   * <code>webserver.accesslog.retention.days</code>
+   */
+  public static final String WEBSERVER_ACCESSLOG_RETENTION_DAYS = "webserver.accesslog.retention.days";
+  private static final String WEBSERVER_ACCESSLOG_RETENTION_DAYS_DOC = "HTTP Request log retention days";
+
+
   static {
     CONFIG = new ConfigDef()
+        .define(WEBSERVER_HTTP_PORT_CONFIG, ConfigDef.Type.INT, 9090, atLeast(0), ConfigDef.Importance.HIGH,
+                WEBSERVER_HTTP_PORT_DOC)
+        .define(WEBSERVER_HTTP_ADDRESS_CONFIG, ConfigDef.Type.STRING, "127.0.0.1", ConfigDef.Importance.HIGH,
+                WEBSERVER_HTTP_ADDRESS_DOC)
+        .define(WEBSERVER_HTTP_CORS_ENABLED_CONFIG, ConfigDef.Type.BOOLEAN, false, ConfigDef.Importance.LOW,
+                WEBSERVER_HTTP_CORS_ENABLED_DOC)
+        .define(WEBSERVER_HTTP_CORS_ORIGIN_CONFIG, ConfigDef.Type.STRING, "*", ConfigDef.Importance.LOW,
+                WEBSERVER_HTTP_CORS_ORIGIN_DOC)
+        .define(WEBSERVER_HTTP_CORS_ALLOWMETHODS_CONFIG, ConfigDef.Type.STRING, "OPTIONS, GET, POST", ConfigDef.Importance.HIGH,
+                WEBSERVER_HTTP_CORS_ALLOWMETHODS_DOC)
+        .define(WEBSERVER_HTTP_CORS_EXPOSEHEADERS_CONFIG, ConfigDef.Type.STRING, "User-Task-ID", ConfigDef.Importance.HIGH,
+                WEBSERVER_HTTP_CORS_EXPOSEHEADERS_DOC)
+        .define(WEBSERVER_API_URLPREFIX, ConfigDef.Type.STRING, "/kafkacruisecontrol/*", ConfigDef.Importance.HIGH,
+                WEBSERVER_API_URLPREFIX_DOC)
+        .define(WEBSERVER_UI_DISKPATH, ConfigDef.Type.STRING, "./cruise-control-ui/dist/", ConfigDef.Importance.MEDIUM,
+                WEBSERVER_UI_DISKPATH_DOC)
+        .define(WEBSERVER_UI_URLPREFIX, ConfigDef.Type.STRING, "/*", ConfigDef.Importance.MEDIUM,
+                WEBSERVER_UI_URLPREFIX_DOC)
+        .define(WEBSERVER_REQUEST_MAX_BLOCK_TIME_MS, ConfigDef.Type.LONG, 10000L, atLeast(0L), ConfigDef.Importance.HIGH,
+                WEBSERVER_REQUEST_MAX_BLOCK_TIME_MS_DOC)
+        .define(WEBSERVER_SESSION_EXPIRY_MS, ConfigDef.Type.LONG, 60000L, atLeast(0L), ConfigDef.Importance.HIGH,
+                WEBSERVER_SESSION_EXPIRY_MS_DOC)
+        .define(WEBSERVER_SESSION_PATH, ConfigDef.Type.STRING, "/", ConfigDef.Importance.HIGH,
+                WEBSERVER_SESSION_PATH_DOC)
+        .define(WEBSERVER_ACCESSLOG_ENABLED, ConfigDef.Type.BOOLEAN, true, ConfigDef.Importance.MEDIUM,
+                WEBSERVER_ACCESSLOG_ENABLED_DOC)
+        .define(WEBSERVER_ACCESSLOG_PATH, ConfigDef.Type.STRING, "access.log", ConfigDef.Importance.LOW,
+                WEBSERVER_ACCESSLOG_PATH_DOC)
+        .define(WEBSERVER_ACCESSLOG_RETENTION_DAYS, ConfigDef.Type.INT, 7, atLeast(0), ConfigDef.Importance.LOW,
+                WEBSERVER_ACCESSLOG_RETENTION_DAYS_DOC)
         .define(BOOTSTRAP_SERVERS_CONFIG, ConfigDef.Type.LIST, ConfigDef.Importance.HIGH,
                 CommonClientConfigs.BOOTSTRAP_SERVERS_DOC)
         .define(CLIENT_ID_CONFIG, ConfigDef.Type.STRING, "kafka-cruise-control", ConfigDef.Importance.MEDIUM,
@@ -512,7 +703,7 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
                 CommonClientConfigs.RECEIVE_BUFFER_DOC)
         .define(RECONNECT_BACKOFF_MS_CONFIG, ConfigDef.Type.LONG, 50L, atLeast(0L), ConfigDef.Importance.LOW,
                 CommonClientConfigs.RECONNECT_BACKOFF_MS_DOC)
-        .define(METADATA_MAX_AGE_CONFIG, ConfigDef.Type.LONG, 5 * 60 * 1000, atLeast(0), ConfigDef.Importance.LOW,
+        .define(METADATA_MAX_AGE_CONFIG, ConfigDef.Type.LONG, 55 * 1000, atLeast(0), ConfigDef.Importance.LOW,
                 METADATA_MAX_AGE_DOC)
         .define(CONNECTIONS_MAX_IDLE_MS_CONFIG,
                 ConfigDef.Type.LONG,
@@ -561,6 +752,36 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
                 atLeast(1),
                 ConfigDef.Importance.HIGH,
                 BROKER_METRICS_WINDOW_MS_DOC)
+        .define(COMPLETED_USER_TASK_RETENTION_TIME_MS_CONFIG,
+                ConfigDef.Type.LONG,
+                TimeUnit.HOURS.toMillis(24),
+                atLeast(0),
+                ConfigDef.Importance.MEDIUM,
+                COMPLETED_USER_TASK_RETENTION_TIME_MS_DOC)
+        .define(DEMOTION_HISTORY_RETENTION_TIME_MS_CONFIG,
+                ConfigDef.Type.LONG,
+                TimeUnit.HOURS.toMillis(336),
+                atLeast(0),
+                ConfigDef.Importance.MEDIUM,
+                DEMOTION_HISTORY_RETENTION_TIME_MS_DOC)
+        .define(REMOVAL_HISTORY_RETENTION_TIME_MS_CONFIG,
+                ConfigDef.Type.LONG,
+                TimeUnit.HOURS.toMillis(336),
+                atLeast(0),
+                ConfigDef.Importance.MEDIUM,
+                REMOVAL_HISTORY_RETENTION_TIME_MS_DOC)
+        .define(MAX_CACHED_COMPLETED_USER_TASKS_CONFIG,
+                ConfigDef.Type.INT,
+                100,
+                atLeast(0),
+                ConfigDef.Importance.MEDIUM,
+                MAX_CACHED_COMPLETED_USER_TASKS_DOC)
+        .define(MAX_ACTIVE_USER_TASKS_CONFIG,
+                ConfigDef.Type.INT,
+                5,
+                atLeast(1),
+                ConfigDef.Importance.HIGH,
+                MAX_ACTIVE_USER_TASKS_DOC)
         .define(NUM_BROKER_METRICS_WINDOWS_CONFIG,
                 ConfigDef.Type.INT,
                 5,
@@ -595,6 +816,12 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
                 1,
                 ConfigDef.Importance.HIGH,
                 NUM_METRIC_FETCHERS_DOC)
+        .define(NUM_CACHED_RECENT_ANOMALY_STATES_CONFIG,
+            ConfigDef.Type.INT,
+            10,
+            between(1, 100),
+            ConfigDef.Importance.LOW,
+            NUM_CACHED_RECENT_ANOMALY_STATES_DOC)
         .define(METRIC_SAMPLER_CLASS_CONFIG,
                 ConfigDef.Type.CLASS,
                 CruiseControlMetricsReporterSampler.class.getName(),
@@ -769,6 +996,11 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
                 atLeast(1),
                 ConfigDef.Importance.MEDIUM,
                 NUM_CONCURRENT_LEADER_MOVEMENTS_DOC)
+        .define(REPLICA_MOVEMENT_STRATEGIES_CONFIG,
+                ConfigDef.Type.LIST,
+                BaseReplicaMovementStrategy.class.getName(),
+                ConfigDef.Importance.MEDIUM,
+                REPLICA_MOVEMENT_STRATEGIES_DOC)
         .define(EXECUTION_PROGRESS_CHECK_INTERVAL_MS_CONFIG,
                 ConfigDef.Type.LONG,
                 10000L,
@@ -794,10 +1026,20 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
                     .add(TopicReplicaDistributionGoal.class.getName()).toString(),
                 ConfigDef.Importance.HIGH,
                 GOALS_DOC)
+        .define(HARD_GOALS_CONFIG,
+                ConfigDef.Type.LIST,
+                new StringJoiner(",")
+                    .add(RackAwareGoal.class.getName())
+                    .add(ReplicaCapacityGoal.class.getName())
+                    .add(DiskCapacityGoal.class.getName())
+                    .add(NetworkInboundCapacityGoal.class.getName())
+                    .add(NetworkOutboundCapacityGoal.class.getName())
+                    .add(CpuCapacityGoal.class.getName()).toString(),
+                ConfigDef.Importance.HIGH,
+                HARD_GOALS_DOC)
         .define(DEFAULT_GOALS_CONFIG,
                 ConfigDef.Type.LIST,
-                "",
-                ConfigDef.Importance.MEDIUM,
+                ConfigDef.Importance.HIGH,
                 DEFAULT_GOALS_DOC)
         .define(ANOMALY_NOTIFIER_CLASS_CONFIG,
                 ConfigDef.Type.CLASS,
@@ -808,23 +1050,17 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
                 300000L,
                 ConfigDef.Importance.LOW,
                 ANOMALY_DETECTION_INTERVAL_MS_DOC)
+        .define(ANOMALY_DETECTION_ALLOW_CAPACITY_ESTIMATION_CONFIG,
+                ConfigDef.Type.BOOLEAN,
+                true,
+                ConfigDef.Importance.LOW,
+                ANOMALY_DETECTION_ALLOW_CAPACITY_ESTIMATION_DOC)
         .define(ANOMALY_DETECTION_GOALS_CONFIG,
                 ConfigDef.Type.LIST,
                 new StringJoiner(",")
                     .add(RackAwareGoal.class.getName())
                     .add(ReplicaCapacityGoal.class.getName())
-                    .add(DiskCapacityGoal.class.getName())
-                    .add(NetworkInboundCapacityGoal.class.getName())
-                    .add(NetworkOutboundCapacityGoal.class.getName())
-                    .add(CpuCapacityGoal.class.getName())
-                    .add(ReplicaDistributionGoal.class.getName())
-                    .add(PotentialNwOutGoal.class.getName())
-                    .add(DiskUsageDistributionGoal.class.getName())
-                    .add(NetworkInboundUsageDistributionGoal.class.getName())
-                    .add(NetworkOutboundUsageDistributionGoal.class.getName())
-                    .add(CpuUsageDistributionGoal.class.getName())
-                    .add(LeaderBytesInDistributionGoal.class.getName())
-                    .add(TopicReplicaDistributionGoal.class.getName()).toString(),
+                    .add(DiskCapacityGoal.class.getName()).toString(),
                 ConfigDef.Importance.MEDIUM,
                 ANOMALY_DETECTION_GOALS_DOC)
         .define(FAILED_BROKERS_ZK_PATH_CONFIG,
@@ -884,25 +1120,65 @@ public class KafkaCruiseControlConfig extends AbstractConfig {
   }
 
   /**
-   * Sanity check for case insensitive goal names.
+   * Sanity check for
+   * (1) {@link KafkaCruiseControlConfig#GOALS_CONFIG} is non-empty.
+   * (2) Case insensitive goal names.
+   * (3) {@link KafkaCruiseControlConfig#DEFAULT_GOALS_CONFIG} is non-empty.
+   * (4) {@link KafkaCruiseControlConfig#ANOMALY_DETECTION_GOALS_CONFIG} is a sublist of {@link KafkaCruiseControlConfig#GOALS_CONFIG}.
    */
   private void sanityCheckGoalNames() {
     List<String> goalNames = getList(KafkaCruiseControlConfig.GOALS_CONFIG);
+    // Ensure that goals is non-empty.
+    if (goalNames.isEmpty()) {
+      throw new ConfigException("Attempt to configure goals configuration with an empty list of goals.");
+    }
+
     Set<String> caseInsensitiveGoalNames = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
     for (String goalName: goalNames) {
       if (!caseInsensitiveGoalNames.add(goalName.replaceAll(".*\\.", ""))) {
         throw new ConfigException("Attempt to configure goals with case sensitive names.");
       }
     }
+    // Ensure that default goals is non-empty.
+    List<String> defaultGoalNames = getList(KafkaCruiseControlConfig.DEFAULT_GOALS_CONFIG);
+    if (defaultGoalNames.isEmpty()) {
+      throw new ConfigException("Attempt to configure default goals configuration with an empty list of goals.");
+    }
+
+    // Ensure that goals used for anomaly detection are supported goals.
+    List<String> anomalyDetectionGoalNames = getList(KafkaCruiseControlConfig.ANOMALY_DETECTION_GOALS_CONFIG);
+    if (anomalyDetectionGoalNames.stream().anyMatch(g -> !defaultGoalNames.contains(g))) {
+      throw new ConfigException("Attempt to configure anomaly detection goals with unsupported goals.");
+    }
+  }
+
+  /**
+   * Sanity check to ensure that {@link KafkaCruiseControlConfig#METADATA_MAX_AGE_CONFIG} is not longer than
+   * {@link KafkaCruiseControlConfig#METRIC_SAMPLING_INTERVAL_MS_CONFIG}.
+   *
+   * Sampling process involves a potential metadata update if the current metadata is stale. The configuration
+   * {@link KafkaCruiseControlConfig#METADATA_MAX_AGE_CONFIG} indicates the timeout of such a metadata update. Hence,
+   * this subprocess of the sampling process cannot be set with a timeout larger than the total sampling timeout of
+   * {@link KafkaCruiseControlConfig#METRIC_SAMPLING_INTERVAL_MS_CONFIG}.
+   */
+  private void sanityCheckSamplingPeriod() {
+    long samplingPeriodMs = getLong(KafkaCruiseControlConfig.METRIC_SAMPLING_INTERVAL_MS_CONFIG);
+    long metadataTimeoutMs = getLong(KafkaCruiseControlConfig.METADATA_MAX_AGE_CONFIG);
+    if (metadataTimeoutMs >  samplingPeriodMs) {
+      throw new ConfigException("Attempt to set metadata refresh timeout [" + metadataTimeoutMs +
+          "] to be longer than sampling period [" + samplingPeriodMs + "].");
+    }
   }
 
   public KafkaCruiseControlConfig(Map<?, ?> originals) {
     super(CONFIG, originals);
     sanityCheckGoalNames();
+    sanityCheckSamplingPeriod();
   }
 
   public KafkaCruiseControlConfig(Map<?, ?> originals, boolean doLog) {
     super(CONFIG, originals, doLog);
     sanityCheckGoalNames();
+    sanityCheckSamplingPeriod();
   }
 }

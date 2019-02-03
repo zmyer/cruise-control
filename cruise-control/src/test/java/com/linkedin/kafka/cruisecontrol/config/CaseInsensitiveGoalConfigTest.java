@@ -13,7 +13,6 @@ import org.junit.Test;
 import org.junit.rules.ExpectedException;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.Parameters;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,8 +29,8 @@ public class CaseInsensitiveGoalConfigTest {
   @Rule
   public ExpectedException expected = ExpectedException.none();
 
-  @Parameters
-  public static Collection<Object[]> data() throws Exception {
+  @Parameterized.Parameters
+  public static Collection<Object[]> data() {
     Collection<Object[]> params = new ArrayList<>();
 
 
@@ -57,6 +56,22 @@ public class CaseInsensitiveGoalConfigTest {
             + "com.linkedin.kafka.cruisecontrol.analyzer.goals.LeaderBytesInDistributionGoal,"
             + "com.linkedin.kafka.cruisecontrol.analyzer.goals.TopicReplicaDistributionGoal,"
             + "com.linkedin.kafka.cruisecontrol.analyzer.goals.ReplicaDistributionGoal");
+    caseInsensitiveGoalProps.setProperty(
+        KafkaCruiseControlConfig.DEFAULT_GOALS_CONFIG,
+        "com.linkedin.kafka.cruisecontrol.analyzer.goals.RackAwareGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.ReplicaCapacityGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.DiskCapacityGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.NetworkInboundCapacityGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.NetworkOutboundCapacityGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.CpuCapacityGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.ReplicaDistributionGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.PotentialNwOutGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.DiskUsageDistributionGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.NetworkInboundUsageDistributionGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.NetworkOutboundUsageDistributionGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.CpuUsageDistributionGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.LeaderBytesInDistributionGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.TopicReplicaDistributionGoal");
 
     Object[] withCaseInsensitiveGoalParams = {caseInsensitiveGoalProps, null};
     params.add(withCaseInsensitiveGoalParams);
@@ -91,8 +106,8 @@ public class CaseInsensitiveGoalConfigTest {
   }
 
   @Test
-  public void test() throws Exception {
-    LOG.debug("Testing case insensitive goal configuration: {}.", _properties.toString());
+  public void test() {
+    LOG.debug("Testing case insensitive goal configuration: {}.", _properties);
 
     if (_exceptionClass != null) {
       expected.expect(_exceptionClass);

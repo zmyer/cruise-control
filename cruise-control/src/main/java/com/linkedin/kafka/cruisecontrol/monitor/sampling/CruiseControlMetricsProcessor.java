@@ -6,6 +6,7 @@ package com.linkedin.kafka.cruisecontrol.monitor.sampling;
 
 import com.linkedin.cruisecontrol.metricdef.MetricDef;
 import com.linkedin.cruisecontrol.metricdef.MetricInfo;
+import com.linkedin.kafka.cruisecontrol.metricsreporter.exception.UnknownVersionException;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.CruiseControlMetric;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.RawMetricType;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.PartitionMetric;
@@ -61,15 +62,15 @@ public class CruiseControlMetricsProcessor {
   /**
    * Process all the added {@link CruiseControlMetric} to get the {@link MetricSampler.Samples}
    *
-   * @param cluster the Kafka cluster.
-   * @param partitions the partitions to construct samples for.
-   * @param samplingMode the sampling mode to indicate which type of samples are needed.
+   * @param cluster Kafka cluster.
+   * @param partitionsDotNotHandled Partitions to construct samples for. The topic partition name may have dots.
+   * @param samplingMode The sampling mode to indicate which type of samples are needed.
    *
    * @return the constructed metric samples.
    */
   MetricSampler.Samples process(Cluster cluster,
-                                Collection<TopicPartition> partitions,
-                                MetricSampler.SamplingMode samplingMode) {
+                                Collection<TopicPartition> partitionsDotNotHandled,
+                                MetricSampler.SamplingMode samplingMode) throws UnknownVersionException {
     Map<Integer, Map<String, Integer>> leaderDistributionStats = leaderDistributionStats(cluster);
     // Theoretically we should not move forward at all if a broker reported a different all topic bytes in from all
     // its resident replicas. However, it is not clear how often this would happen yet. At this point we still
@@ -84,7 +85,7 @@ public class CruiseControlMetricsProcessor {
     int skippedPartition = 0;
     if (samplingMode == MetricSampler.SamplingMode.ALL
         || samplingMode == MetricSampler.SamplingMode.PARTITION_METRICS_ONLY) {
-      skippedPartition = addPartitionMetricSamples(cluster, partitions, leaderDistributionStats, partitionMetricSamples);
+      skippedPartition = addPartitionMetricSamples(cluster, partitionsDotNotHandled, leaderDistributionStats, partitionMetricSamples);
     }
 
     // Get broker metric samples.
@@ -109,29 +110,29 @@ public class CruiseControlMetricsProcessor {
   /**
    * Add the partition metric samples to the provided set.
    *
-   * @param cluster the Kafka cluster
-   * @param partitions the partitions to get samples.
-   * @param leaderDistributionStats the leader count per topic/broker
-   * @param partitionMetricSamples the set to add the partition samples to.
-   * @return the number of skipped partitions.
+   * @param cluster Kafka cluster
+   * @param partitionsDotNotHandled The partitions to get samples. The topic partition name may have dots.
+   * @param leaderDistributionStats The leader count per topic/broker
+   * @param partitionMetricSamples The set to add the partition samples to.
+   * @return The number of skipped partitions.
    */
   private int addPartitionMetricSamples(Cluster cluster,
-                                        Collection<TopicPartition> partitions,
+                                        Collection<TopicPartition> partitionsDotNotHandled,
                                         Map<Integer, Map<String, Integer>> leaderDistributionStats,
                                         Set<PartitionMetricSample> partitionMetricSamples) {
     int skippedPartition = 0;
 
-      for (TopicPartition tp : partitions) {
+      for (TopicPartition tpDotNotHandled : partitionsDotNotHandled) {
         try {
-          PartitionMetricSample sample = buildPartitionMetricSample(cluster, tp, leaderDistributionStats);
+          PartitionMetricSample sample = buildPartitionMetricSample(cluster, tpDotNotHandled, leaderDistributionStats);
           if (sample != null) {
-            LOG.trace("Added partition metrics sample for {}", tp);
+            LOG.trace("Added partition metrics sample for {}", tpDotNotHandled);
             partitionMetricSamples.add(sample);
           } else {
             skippedPartition++;
           }
         } catch (Exception e) {
-          LOG.error("Error building partition metric sample for " + tp, e);
+          LOG.error("Error building partition metric sample for " + tpDotNotHandled, e);
           skippedPartition++;
         }
       }
@@ -141,38 +142,46 @@ public class CruiseControlMetricsProcessor {
   /**
    * Add the broker metric samples to the provided set.
    *
-   * @param cluster the Kafka cluster
-   * @param brokerMetricSamples the set to add the broker samples to.
-   * @return the number of skipped brokers.
+   * @param cluster The Kafka cluster
+   * @param brokerMetricSamples The set to add the broker samples to.
+   * @return The number of skipped brokers.
    */
   private int addBrokerMetricSamples(Cluster cluster,
-                                     Set<BrokerMetricSample> brokerMetricSamples) {
+                                     Set<BrokerMetricSample> brokerMetricSamples) throws UnknownVersionException {
     int skippedBroker = 0;
     MetricDef brokerMetricDef = KafkaMetricDef.brokerMetricDef();
     for (Node node : cluster.nodes()) {
       BrokerLoad brokerLoad = _brokerLoad.get(node.id());
-      if (brokerLoad == null || !brokerLoad.allBrokerMetricsAvailable()) {
-        // A new broker or broker metrics are not consistent.
-        LOG.warn("Skip generating broker metric sample for broker {} because the following metrics are missing {}",
-                  node.id(), brokerLoad == null ? "All Broker Metrics" : brokerLoad.missingBrokerMetrics());
-        skippedBroker++;
+      if (brokerLoad == null) {
+        LOG.warn("Skip generating broker metric sample for broker {} because all broker metrics are missing.", node.id());
+        continue;
+      } else if (!brokerLoad.minRequiredBrokerMetricsAvailable()) {
+        if (brokerLoad.missingBrokerMetricsInMinSupportedVersion().size() == 0) {
+          LOG.warn("Skip generating broker metric sample for broker {} because there are not enough topic metrics to "
+                  + "generate broker metrics.", node.id());
+        } else {
+          LOG.warn("Skip generating broker metric sample for broker {} because the following required metrics are missing {}.",
+              node.id(), brokerLoad.missingBrokerMetricsInMinSupportedVersion());
+        }
         continue;
       }
 
       boolean validSample = true;
-      BrokerMetricSample brokerMetricSample = new BrokerMetricSample(node.host(), node.id());
-      for (RawMetricType rawBrokerMetricType : RawMetricType.brokerMetricTypes()) {
-        // We require the broker to report all the metric types. Otherwise we skip the broker.
-        if (!brokerLoad.brokerMetricAvailable(rawBrokerMetricType)) {
-          skippedBroker++;
-          validSample = false;
-          LOG.warn("Skip generating broker metric sample for broker {} because it does not have %s metrics or "
-                        + "the metrics are inconsistent.", node.id(), rawBrokerMetricType);
-          break;
-        } else {
-          MetricInfo metricInfo = brokerMetricDef.metricInfo(KafkaMetricDef.forRawMetricType(rawBrokerMetricType).name());
-          double metricValue = brokerLoad.brokerMetric(rawBrokerMetricType);
-          brokerMetricSample.record(metricInfo, metricValue);
+      BrokerMetricSample brokerMetricSample = new BrokerMetricSample(node.host(), node.id(), brokerLoad._brokerSampleDeserializationVersion);
+      for (Map.Entry<Byte, Set<RawMetricType>> entry : RawMetricType.brokerMetricTypesDiffByVersion().entrySet()) {
+        for (RawMetricType rawBrokerMetricType : entry.getValue()) {
+          // We require the broker to report all the metric types (including nullable values). Otherwise we skip the broker.
+          if (!brokerLoad.brokerMetricAvailable(rawBrokerMetricType)) {
+            skippedBroker++;
+            validSample = false;
+            LOG.warn("Skip generating broker metric sample for broker {} because it does not have {} metrics (serde "
+                     + "version {}) or the metrics are inconsistent.", node.id(), rawBrokerMetricType, entry.getKey());
+            break;
+          } else {
+            MetricInfo metricInfo = brokerMetricDef.metricInfo(KafkaMetricDef.forRawMetricType(rawBrokerMetricType).name());
+            double metricValue = brokerLoad.brokerMetric(rawBrokerMetricType);
+            brokerMetricSample.record(metricInfo, metricValue);
+          }
         }
       }
 
@@ -207,10 +216,10 @@ public class CruiseControlMetricsProcessor {
   }
 
   private PartitionMetricSample buildPartitionMetricSample(Cluster cluster,
-                                                           TopicPartition tp,
+                                                           TopicPartition tpDotNotHandled,
                                                            Map<Integer, Map<String, Integer>> leaderDistributionStats) {
-    TopicPartition tpWithDotHandled = partitionHandleDotInTopicName(tp);
-    Node leaderNode = cluster.leaderFor(tp);
+    TopicPartition tpWithDotHandled = ModelUtils.partitionHandleDotInTopicName(tpDotNotHandled);
+    Node leaderNode = cluster.leaderFor(tpDotNotHandled);
     if (leaderNode == null) {
       return null;
     }
@@ -220,26 +229,26 @@ public class CruiseControlMetricsProcessor {
     // Ensure broker load is available.
     if (brokerLoad == null || !brokerLoad.brokerMetricAvailable(BROKER_CPU_UTIL)) {
       LOG.debug("Skip generating metric sample for partition {} because broker metric for broker {} is unavailable.",
-                tp, leaderId);
+                tpDotNotHandled, leaderId);
       return null;
     }
     // Ensure the topic load is available.
-    if (!brokerLoad.allTopicMetricsAvailable(tpWithDotHandled.topic())) {
+    if (!brokerLoad.allDotHandledTopicMetricsAvailable(tpWithDotHandled.topic())) {
       LOG.debug("Skip generating metric samples for partition {} because broker {} has no metric or topic metrics "
-                    + "are not available", tp, leaderId);
+                    + "are not available", tpDotNotHandled, leaderId);
       return null;
     }
     if (!brokerLoad.partitionMetricAvailable(tpWithDotHandled, PARTITION_SIZE)) {
       // This broker is no longer the leader.
-      LOG.debug("Skip generating metric sample for partition {} because broker {} no long host the partition.", tp, leaderId);
+      LOG.debug("Skip generating metric sample for partition {} because broker {} no long host the partition.", tpDotNotHandled, leaderId);
       return null;
     }
     // Ensure there is a partition size.
     double partSize = brokerLoad.partitionMetric(tpWithDotHandled.topic(), tpWithDotHandled.partition(), PARTITION_SIZE);
     // Fill in all the common metrics.
-    PartitionMetricSample pms = new PartitionMetricSample(leaderId, tp);
+    PartitionMetricSample pms = new PartitionMetricSample(leaderId, tpDotNotHandled);
     MetricDef commonMetricDef = KafkaMetricDef.commonMetricDef();
-    int numLeaderPartitionsOnBroker = leaderDistributionStats.get(leaderId).get(tp.topic());
+    int numLeaderPartitionsOnBroker = leaderDistributionStats.get(leaderId).get(tpDotNotHandled.topic());
     for (RawMetricType rawTopicMetricType : RawMetricType.topicMetricTypes()) {
       MetricInfo metricInfo = commonMetricDef.metricInfo(KafkaMetricDef.forRawMetricType(rawTopicMetricType).name());
       double metricValue = brokerLoad.topicMetrics(tpWithDotHandled.topic(), rawTopicMetricType);
@@ -262,12 +271,6 @@ public class CruiseControlMetricsProcessor {
     pms.record(commonMetricDef.metricInfo(KafkaMetricDef.CPU_USAGE.name()), cpuUsage);
     pms.close(_maxMetricTimestamp);
     return pms;
-  }
-
-  private TopicPartition partitionHandleDotInTopicName(TopicPartition tp) {
-    // In the reported metrics, the "." in the topic name will be replaced by "_".
-    return !tp.topic().contains(".") ? tp :
-      new TopicPartition(tp.topic().replace('.', '_'), tp.partition());
   }
 
   private static double convertUnit(double value, RawMetricType rawMetricType) {
@@ -295,14 +298,14 @@ public class CruiseControlMetricsProcessor {
    */
   private static class BrokerLoad {
     private final RawMetricsHolder _brokerMetrics = new RawMetricsHolder();
-    private final Map<String, RawMetricsHolder> _topicMetrics = new HashMap<>();
-    private final Map<TopicPartition, RawMetricsHolder> _partitionMetrics = new HashMap<>();
+    private final Map<String, RawMetricsHolder> _dotHandledTopicMetrics = new HashMap<>();
+    private final Map<TopicPartition, RawMetricsHolder> _dotHandledPartitionMetrics = new HashMap<>();
     // Remember which topic has partition size reported. Because the topic level IO metrics are only created when
     // there is IO, the topic level IO metrics may be missing if there was no traffic to the topic on the broker.
     // However, because the partition size will always be reported, when we see partition size was reported for
     // a topic but the topic level IO metrics are not reported, we assume there was no traffic to the topic.
-    private final Set<String> _topicsWithPartitionSizeReported = new HashSet<>();
-    private final Set<RawMetricType> _missingBrokerMetrics = new HashSet<>();
+    private final Set<String> _dotHandledTopicsWithPartitionSizeReported = new HashSet<>();
+    private final Set<RawMetricType> _missingBrokerMetricsInMinSupportedVersion = new HashSet<>();
 
     private static final Map<RawMetricType, RawMetricType> METRIC_TYPES_TO_SUM = new HashMap<>();
     static {
@@ -315,7 +318,9 @@ public class CruiseControlMetricsProcessor {
       METRIC_TYPES_TO_SUM.put(TOPIC_MESSAGES_IN_PER_SEC, ALL_TOPIC_MESSAGES_IN_PER_SEC);
     }
 
-    private boolean _brokerMetricsAvailable = false;
+    private boolean _minRequiredBrokerMetricsAvailable = false;
+    // Set to the latest possible deserialization version based on the sampled data.
+    private byte _brokerSampleDeserializationVersion = -1;
 
     private void recordMetric(CruiseControlMetric ccm) {
       RawMetricType rawMetricType = ccm.rawMetricType();
@@ -325,14 +330,14 @@ public class CruiseControlMetricsProcessor {
           break;
         case TOPIC:
           TopicMetric tm = (TopicMetric) ccm;
-          _topicMetrics.computeIfAbsent(tm.topic(), t -> new RawMetricsHolder())
-                       .recordCruiseControlMetric(ccm);
+          _dotHandledTopicMetrics.computeIfAbsent(tm.topic(), t -> new RawMetricsHolder())
+                                 .recordCruiseControlMetric(ccm);
           break;
         case PARTITION:
           PartitionMetric pm = (PartitionMetric) ccm;
-          _partitionMetrics.computeIfAbsent(new TopicPartition(pm.topic(), pm.partition()), tp -> new RawMetricsHolder())
-                           .recordCruiseControlMetric(ccm);
-          _topicsWithPartitionSizeReported.add(pm.topic());
+          _dotHandledPartitionMetrics.computeIfAbsent(new TopicPartition(pm.topic(), pm.partition()), tp -> new RawMetricsHolder())
+                                     .recordCruiseControlMetric(ccm);
+          _dotHandledTopicsWithPartitionSizeReported.add(pm.topic());
           break;
         default:
           throw new IllegalStateException(String.format("Should never be here. Unrecognized metric scope %s",
@@ -340,31 +345,28 @@ public class CruiseControlMetricsProcessor {
       }
     }
 
-    private boolean allTopicMetricsAvailable(String topic) {
+    private boolean allDotHandledTopicMetricsAvailable(String dotHandledTopic) {
       // We rely on the partition size metric to determine whether a topic metric is available or not.
-      return _topicsWithPartitionSizeReported.contains(topic);
+      // The topic names in this set are dot handled -- i.e. dots (".") in topic name is replaced with underscores ("_").
+      // Note that metrics reporter implicitly does this conversion, but the metadata topic names keep the original name.
+      return _dotHandledTopicsWithPartitionSizeReported.contains(dotHandledTopic);
     }
 
-    private boolean allBrokerMetricsAvailable() {
-      return _brokerMetricsAvailable;
+    private boolean minRequiredBrokerMetricsAvailable() {
+      return _minRequiredBrokerMetricsAvailable;
     }
 
     private boolean brokerMetricAvailable(RawMetricType rawMetricType) {
       return _brokerMetrics.metricValue(rawMetricType) != null;
     }
 
-    private boolean topicMetricAvailable(String topic, RawMetricType rawMetricType) {
-      RawMetricsHolder rawMetricsHolder = _topicMetrics.get(topic);
+    private boolean partitionMetricAvailable(TopicPartition tpWithDotHandled, RawMetricType rawMetricType) {
+      RawMetricsHolder rawMetricsHolder = _dotHandledPartitionMetrics.get(tpWithDotHandled);
       return rawMetricsHolder != null && rawMetricsHolder.metricValue(rawMetricType) != null;
     }
 
-    private boolean partitionMetricAvailable(TopicPartition tp, RawMetricType rawMetricType) {
-      RawMetricsHolder rawMetricsHolder = _partitionMetrics.get(tp);
-      return rawMetricsHolder != null && rawMetricsHolder.metricValue(rawMetricType) != null;
-    }
-
-    private Set<RawMetricType> missingBrokerMetrics() {
-      return _missingBrokerMetrics;
+    private Set<RawMetricType> missingBrokerMetricsInMinSupportedVersion() {
+      return _missingBrokerMetricsInMinSupportedVersion;
     }
 
     private double brokerMetric(RawMetricType rawMetricType) {
@@ -377,16 +379,16 @@ public class CruiseControlMetricsProcessor {
       }
     }
 
-    private double topicMetrics(String topic, RawMetricType rawMetricType) {
-      return topicMetrics(topic, rawMetricType, true);
+    private double topicMetrics(String dotHandledTopic, RawMetricType rawMetricType) {
+      return topicMetrics(dotHandledTopic, rawMetricType, true);
     }
 
-    private double topicMetrics(String topic, RawMetricType rawMetricType, boolean convertUnit) {
+    private double topicMetrics(String dotHandledTopic, RawMetricType rawMetricType, boolean convertUnit) {
       checkMetricScope(rawMetricType, TOPIC);
-      if (!allTopicMetricsAvailable(topic)) {
+      if (!allDotHandledTopicMetricsAvailable(dotHandledTopic)) {
         throw new IllegalArgumentException(String.format("Topic metric %s does not exist.", rawMetricType));
       }
-      RawMetricsHolder rawMetricsHolder = _topicMetrics.get(topic);
+      RawMetricsHolder rawMetricsHolder = _dotHandledTopicMetrics.get(dotHandledTopic);
       if (rawMetricsHolder == null || rawMetricsHolder.metricValue(rawMetricType) == null) {
           return 0.0;
       }
@@ -394,9 +396,9 @@ public class CruiseControlMetricsProcessor {
       return convertUnit ? convertUnit(rawMetricValue, rawMetricType) : rawMetricValue;
     }
 
-    private double partitionMetric(String topic, int partition, RawMetricType rawMetricType) {
+    private double partitionMetric(String dotHandledTopic, int partition, RawMetricType rawMetricType) {
       checkMetricScope(rawMetricType, PARTITION);
-      RawMetricsHolder metricsHolder = _partitionMetrics.get(new TopicPartition(topic, partition));
+      RawMetricsHolder metricsHolder = _dotHandledPartitionMetrics.get(new TopicPartition(dotHandledTopic, partition));
       if (metricsHolder == null || metricsHolder.metricValue(rawMetricType) == null) {
         throw new IllegalArgumentException(String.format("Partition metric %s does not exist.", rawMetricType));
       } else {
@@ -427,21 +429,21 @@ public class CruiseControlMetricsProcessor {
      * </ul>
      *
      * We use the cluster metadata to check if the reported topic level metrics are complete. If the reported topic
-     * level metrics are not complete, we ignore the broker metric sample by setting the _brokerMetricsAvailable flag
-     * to false.
+     * level metrics are not complete, we ignore the broker metric sample by setting the _minRequiredBrokerMetricsAvailable
+     * flag to false.
      *
      * @param cluster The Kafka cluster.
-     * @param brokerId the broker id to prepare metrics for.
-     * @param time the last sample time.
+     * @param brokerId The broker id to prepare metrics for.
+     * @param time The last sample time.
      */
     private void prepareBrokerMetrics(Cluster cluster, int brokerId, long time) {
       boolean enoughTopicPartitionMetrics = enoughTopicPartitionMetrics(cluster, brokerId);
       // Ensure there are enough topic level metrics.
       if (enoughTopicPartitionMetrics) {
         Map<RawMetricType, Double> sumOfTopicMetrics = new HashMap<>();
-        for (String topic : _topicsWithPartitionSizeReported) {
+        for (String dotHandledTopic : _dotHandledTopicsWithPartitionSizeReported) {
           METRIC_TYPES_TO_SUM.keySet().forEach(type -> {
-            double value = topicMetrics(topic, type, false);
+            double value = topicMetrics(dotHandledTopic, type, false);
             sumOfTopicMetrics.compute(type, (t, v) -> (v == null ? 0 : v) + value);
           });
         }
@@ -452,19 +454,67 @@ public class CruiseControlMetricsProcessor {
         }
       }
       // Check if all the broker raw metrics are available.
-      for (RawMetricType rawBrokerMetricType : RawMetricType.brokerMetricTypes()) {
-        if (_brokerMetrics.metricValue(rawBrokerMetricType) == null) {
-          if (allowMissingBrokerMetric(cluster, brokerId, rawBrokerMetricType)) {
-            // If the metric is allowed to be missing, we simply use 0 as the value.
-            _brokerMetrics.setRawMetricValue(rawBrokerMetricType, 0.0, time);
-          } else {
-            _missingBrokerMetrics.add(rawBrokerMetricType);
-          }
-        }
-      }
+      maybeSetBrokerRawMetrics(cluster, brokerId, time);
+
       // A broker metric is only available if it has enough valid topic metrics and it has reported
       // replication bytes in/out metrics.
-      _brokerMetricsAvailable = enoughTopicPartitionMetrics && _missingBrokerMetrics.isEmpty();
+      _minRequiredBrokerMetricsAvailable = enoughTopicPartitionMetrics && _missingBrokerMetricsInMinSupportedVersion.isEmpty();
+    }
+
+    /**
+     * Use the latest supported version for which the raw broker metrics are available.
+     *
+     * 1) If broker metrics are incomplete for the {@link BrokerMetricSample#MIN_SUPPORTED_VERSION}, then broker metrics
+     * are insufficient to create a broker sample.
+     * 2) If broker metrics are complete in a version-X but not in (version-X + 1), then use version-X.
+     *
+     * {@link #_missingBrokerMetricsInMinSupportedVersion} is relevant only for {@link BrokerMetricSample#MIN_SUPPORTED_VERSION}.
+     *
+     * @param cluster The Kafka cluster.
+     * @param brokerId The broker id to prepare metrics for.
+     * @param time The last sample time.
+     */
+    private void maybeSetBrokerRawMetrics(Cluster cluster, int brokerId, long time) {
+      for (byte v = BrokerMetricSample.MIN_SUPPORTED_VERSION; v <= BrokerMetricSample.LATEST_SUPPORTED_VERSION; v++) {
+        Set<RawMetricType> missingBrokerMetrics = new HashSet<>();
+        for (RawMetricType rawBrokerMetricType : RawMetricType.brokerMetricTypesDiffForVersion(v)) {
+          if (_brokerMetrics.metricValue(rawBrokerMetricType) == null) {
+            if (allowMissingBrokerMetric(cluster, brokerId, rawBrokerMetricType)) {
+              // If the metric is allowed to be missing, we simply use 0 as the value.
+              _brokerMetrics.setRawMetricValue(rawBrokerMetricType, 0.0, time);
+            } else {
+              missingBrokerMetrics.add(rawBrokerMetricType);
+            }
+          }
+        }
+
+        if (!missingBrokerMetrics.isEmpty()) {
+          if (_brokerSampleDeserializationVersion == -1) {
+            _missingBrokerMetricsInMinSupportedVersion.addAll(missingBrokerMetrics);
+          }
+          break;
+        } else {
+          // Set supported deserialization version so far.
+          _brokerSampleDeserializationVersion = v;
+        }
+      }
+      // Set nullable broker metrics for missing metrics if a valid deserialization exists with an old version.
+      setNullableBrokerMetrics();
+    }
+
+    public byte brokerSampleDeserializationVersion() {
+      return _brokerSampleDeserializationVersion;
+    }
+
+    private void setNullableBrokerMetrics() {
+      if (_brokerSampleDeserializationVersion != -1) {
+        Set<RawMetricType> nullableBrokerMetrics = new HashSet<>();
+        for (byte v = (byte) (_brokerSampleDeserializationVersion + 1); v <= BrokerMetricSample.LATEST_SUPPORTED_VERSION; v++) {
+          Set<RawMetricType> nullableMetrics = new HashSet<>(RawMetricType.brokerMetricTypesDiffForVersion(v));
+          nullableBrokerMetrics.addAll(nullableMetrics);
+        }
+        nullableBrokerMetrics.forEach(nullableMetric -> _brokerMetrics.setRawMetricValue(nullableMetric, 0.0, 0L));
+      }
     }
 
     /**
@@ -501,6 +551,10 @@ public class CruiseControlMetricsProcessor {
         case BROKER_LOG_FLUSH_RATE:
         case BROKER_LOG_FLUSH_TIME_MS_MEAN:
         case BROKER_LOG_FLUSH_TIME_MS_MAX:
+        case BROKER_LOG_FLUSH_TIME_MS_50TH:
+        case BROKER_LOG_FLUSH_TIME_MS_999TH:
+        case BROKER_PRODUCE_REQUEST_RATE:
+        case BROKER_CONSUMER_FETCH_REQUEST_RATE:
           return true;
         default:
           return false;
@@ -509,12 +563,13 @@ public class CruiseControlMetricsProcessor {
 
     /**
      * Verify whether we have collected enough metrics to generate the broker metric samples. The broker must have
-     * collected more than 99% of the topic level and partition level metrics in the broker to generate broker
-     * level metrics.
+     * missed less than {@link CruiseControlMetricsProcessor#MAX_ALLOWED_MISSING_TOPIC_METRIC_PERCENT} of the topic level
+     * and {@link CruiseControlMetricsProcessor#MAX_ALLOWED_MISSING_PARTITION_METRIC_PERCENT} partition level metrics in the
+     * broker to generate broker level metrics.
      *
-     * @param cluster the Kafka cluster.
-     * @param brokerId the broker id to check.
-     * @return true if there are enough topic level metrics, false otherwise.
+     * @param cluster The Kafka cluster.
+     * @param brokerId The broker id to check.
+     * @return True if there are enough topic level metrics, false otherwise.
      */
     private boolean enoughTopicPartitionMetrics(Cluster cluster, int brokerId) {
       Set<String> missingTopics = new HashSet<>();
@@ -526,25 +581,25 @@ public class CruiseControlMetricsProcessor {
         return true;
       }
       leaderPartitionsInNode.forEach(info -> {
-        topicsInBroker.add(info.topic());
-        if (!_topicsWithPartitionSizeReported.contains(info.topic())) {
+        String topicWithDotHandled = ModelUtils.replaceDotsWithUnderscores(info.topic());
+        topicsInBroker.add(topicWithDotHandled);
+        if (!_dotHandledTopicsWithPartitionSizeReported.contains(topicWithDotHandled)) {
           missingPartitions.incrementAndGet();
-          missingTopics.add(info.topic());
+          missingTopics.add(topicWithDotHandled);
         }
       });
       boolean result = ((double) missingTopics.size() / topicsInBroker.size()) <= MAX_ALLOWED_MISSING_TOPIC_METRIC_PERCENT
           && ((double) missingPartitions.get() / cluster.partitionsForNode(brokerId).size() <= MAX_ALLOWED_MISSING_PARTITION_METRIC_PERCENT);
       if (!result) {
-        LOG.warn("Broker {} has {} missing topics metrics and {} missing partition metrics.",
-                 brokerId, missingTopics, missingPartitions);
-        LOG.trace("Missing topics: {}", missingTopics);
+        LOG.warn("Broker {} is missing {}/{} topics metrics and {}/{} leader partition metrics. Missing leader topics: {}.", brokerId,
+            missingTopics.size(), topicsInBroker.size(), missingPartitions.get(), cluster.partitionsForNode(brokerId).size(), missingTopics);
       }
       return result;
     }
 
     private double diskUsage() {
       double result = 0.0;
-      for (RawMetricsHolder rawMetricsHolder : _partitionMetrics.values()) {
+      for (RawMetricsHolder rawMetricsHolder : _dotHandledPartitionMetrics.values()) {
         result += rawMetricsHolder.metricValue(RawMetricType.PARTITION_SIZE).value();
       }
       return convertUnit(result, PARTITION_SIZE);

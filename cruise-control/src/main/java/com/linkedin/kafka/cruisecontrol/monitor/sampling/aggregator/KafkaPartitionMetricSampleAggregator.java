@@ -63,6 +63,7 @@ public class KafkaPartitionMetricSampleAggregator extends MetricSampleAggregator
     _metadata = metadata;
     _maxAllowedExtrapolationsPerPartition =
         config.getInt(KafkaCruiseControlConfig.MAX_ALLOWED_EXTRAPOLATIONS_PER_PARTITION_CONFIG);
+    _sampleType = SampleType.PARTITION;
 
   }
 
@@ -226,7 +227,7 @@ public class KafkaPartitionMetricSampleAggregator extends MetricSampleAggregator
                                  AggregationOptions.Granularity.ENTITY_GROUP,
                                  true);
     MetricSampleCompleteness<String, PartitionEntity> completeness = completeness(-1, Long.MAX_VALUE, options);
-    return windowIndexesToWindows(completeness.validEntityGroupRatioByWindowIndex(), _windowMs);
+    return windowIndexesToWindows(completeness.validEntityRatioWithGroupGranularityByWindowIndex(), _windowMs);
   }
 
   private Set<PartitionEntity> allPartitions(Cluster cluster) {

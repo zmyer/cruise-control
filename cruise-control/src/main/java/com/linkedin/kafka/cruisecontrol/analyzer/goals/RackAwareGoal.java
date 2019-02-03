@@ -5,6 +5,7 @@
 
 package com.linkedin.kafka.cruisecontrol.analyzer.goals;
 
+import com.linkedin.kafka.cruisecontrol.analyzer.OptimizationOptions;
 import com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance;
 import com.linkedin.kafka.cruisecontrol.analyzer.AnalyzerUtils;
 import com.linkedin.kafka.cruisecontrol.analyzer.BalancingConstraint;
@@ -52,15 +53,6 @@ public class RackAwareGoal extends AbstractGoal {
    */
   RackAwareGoal(BalancingConstraint constraint) {
     _balancingConstraint = constraint;
-  }
-
-  /**
-   * @deprecated
-   * Please use {@link #actionAcceptance(BalancingAction, ClusterModel)} instead.
-   */
-  @Override
-  public boolean isActionAcceptable(BalancingAction action, ClusterModel clusterModel) {
-    return actionAcceptance(action, clusterModel) == ACCEPT;
   }
 
   /**
@@ -173,7 +165,7 @@ public class RackAwareGoal extends AbstractGoal {
   @Override
   protected void initGoalState(ClusterModel clusterModel, Set<String> excludedTopics) throws OptimizationFailureException {
     // Sanity Check: not enough racks to satisfy rack awareness.
-    int numHealthyRacks = clusterModel.numHealthyRacks();
+    int numAliveRacks = clusterModel.numAliveRacks();
     if (!excludedTopics.isEmpty()) {
       int maxReplicationFactorOfIncludedTopics = 1;
       Map<String, Integer> replicationFactorByTopic = clusterModel.replicationFactorByTopic();
@@ -182,12 +174,12 @@ public class RackAwareGoal extends AbstractGoal {
         if (!excludedTopics.contains(replicationFactorByTopicEntry.getKey())) {
           maxReplicationFactorOfIncludedTopics =
               Math.max(maxReplicationFactorOfIncludedTopics, replicationFactorByTopicEntry.getValue());
-          if (maxReplicationFactorOfIncludedTopics > numHealthyRacks) {
+          if (maxReplicationFactorOfIncludedTopics > numAliveRacks) {
             throw new OptimizationFailureException("Insufficient number of racks to distribute included replicas.");
           }
         }
       }
-    } else if (clusterModel.maxReplicationFactor() > numHealthyRacks) {
+    } else if (clusterModel.maxReplicationFactor() > numAliveRacks) {
       throw new OptimizationFailureException("Insufficient number of racks to distribute each replica.");
     }
   }
@@ -218,15 +210,16 @@ public class RackAwareGoal extends AbstractGoal {
    * @param broker         Broker to be balanced.
    * @param clusterModel   The state of the cluster.
    * @param optimizedGoals Optimized goals.
-   * @param excludedTopics The topics that should be excluded from the optimization action.
+   * @param optimizationOptions Options to take into account during optimization -- e.g. excluded topics.
    */
   @Override
   protected void rebalanceForBroker(Broker broker,
                                     ClusterModel clusterModel,
                                     Set<Goal> optimizedGoals,
-                                    Set<String> excludedTopics)
+                                    OptimizationOptions optimizationOptions)
       throws OptimizationFailureException {
     LOG.debug("balancing broker {}, optimized goals = {}", broker, optimizedGoals);
+    Set<String> excludedTopics = optimizationOptions.excludedTopics();
     // Satisfy rack awareness requirement.
     SortedSet<Replica> replicas = new TreeSet<>(broker.replicas());
     for (Replica replica : replicas) {
@@ -236,7 +229,7 @@ public class RackAwareGoal extends AbstractGoal {
       }
       // Rack awareness is violated. Move replica to a broker in another rack.
       if (maybeApplyBalancingAction(clusterModel, replica, rackAwareEligibleBrokers(replica, clusterModel),
-                                    ActionType.REPLICA_MOVEMENT, optimizedGoals) == null) {
+                                    ActionType.REPLICA_MOVEMENT, optimizedGoals, optimizationOptions) == null) {
         throw new OptimizationFailureException(
             "Violated rack-awareness requirement for broker with id " + broker.id() + ".");
       }
@@ -286,7 +279,7 @@ public class RackAwareGoal extends AbstractGoal {
 
     SortedSet<Broker> rackAwareEligibleBrokers = new TreeSet<>((o1, o2) -> {
       return Integer.compare(o1.id(), o2.id()); });
-    for (Broker broker : clusterModel.healthyBrokers()) {
+    for (Broker broker : clusterModel.aliveBrokers()) {
       if (!partitionRackIds.contains(broker.rack().id())) {
         rackAwareEligibleBrokers.add(broker);
       }

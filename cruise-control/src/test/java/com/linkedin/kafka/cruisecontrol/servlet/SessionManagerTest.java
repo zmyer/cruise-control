@@ -5,6 +5,8 @@
 package com.linkedin.kafka.cruisecontrol.servlet;
 
 import com.codahale.metrics.MetricRegistry;
+import com.linkedin.kafka.cruisecontrol.servlet.response.PauseSamplingResult;
+import com.linkedin.kafka.cruisecontrol.servlet.response.ResumeSamplingResult;
 import com.linkedin.kafka.cruisecontrol.async.OperationFuture;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -17,6 +19,7 @@ import org.apache.kafka.common.utils.Time;
 import org.easymock.EasyMock;
 import org.junit.Test;
 
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
@@ -29,26 +32,26 @@ public class SessionManagerTest {
   @Test
   public void testCreateAndCloseSession() {
     TestContext context = prepareRequests(true, 1);
-    SessionManager sessionManager = new SessionManager(1, 1000, context.time(), new MetricRegistry());
+    SessionManager sessionManager = new SessionManager(1, 1000, context.time(), new MetricRegistry(), null);
 
     sessionManager.getAndCreateSessionIfNotExist(context.request(0),
-                                                 () -> new OperationFuture<>("testCreateSession"),
+                                                 () -> new OperationFuture("testCreateSession"),
                                                  0);
     assertEquals(1, sessionManager.numSessions());
 
-    sessionManager.closeSession(context.request(0));
+    sessionManager.closeSession(context.request(0), false);
     assertEquals(0, sessionManager.numSessions());
   }
 
   @Test
   public void testSessionExpiration() {
     TestContext context = prepareRequests(true, 2);
-    SessionManager sessionManager = new SessionManager(2, 1000, context.time(), new MetricRegistry());
+    SessionManager sessionManager = new SessionManager(2, 1000, context.time(), new MetricRegistry(), null);
 
-    List<OperationFuture<Integer>> futures = new ArrayList<>();
+    List<OperationFuture> futures = new ArrayList<>();
     for (int i = 0; i < 2; i++) {
       futures.add(sessionManager.getAndCreateSessionIfNotExist(context.request(i),
-                                                               () -> new OperationFuture<>("testSessionExpiration"),
+                                                               () -> new OperationFuture("testSessionExpiration"),
                                                                0));
     }
     assertEquals(2, sessionManager.numSessions());
@@ -74,22 +77,22 @@ public class SessionManagerTest {
   @Test
   public void testCreateSessionReachingCapacity() {
     TestContext context = prepareRequests(false, 2);
-    SessionManager sessionManager = new SessionManager(1, 1000, context.time(), new MetricRegistry());
+    SessionManager sessionManager = new SessionManager(1, 1000, context.time(), new MetricRegistry(), null);
 
     sessionManager.getAndCreateSessionIfNotExist(context.request(0),
-                                                 () -> new OperationFuture<>("testCreateSession"),
+                                                 () -> new OperationFuture("testCreateSession"),
                                                  0);
     assertEquals(1, sessionManager.numSessions());
     assertNull(sessionManager.getFuture(context.request(1)));
     // Adding same request again should have no impact
     sessionManager.getAndCreateSessionIfNotExist(context.request(0),
-                                                 () -> new OperationFuture<>("testCreateSession"),
+                                                 () -> new OperationFuture("testCreateSession"),
                                                  1);
     assertEquals(1, sessionManager.numSessions());
 
     try {
       sessionManager.getAndCreateSessionIfNotExist(context.request(1),
-                                                   () -> new OperationFuture<>("testCreateSession"),
+                                                   () -> new OperationFuture("testCreateSession"),
                                                    0);
       fail("Should have thrown exception due to session capacity reached.");
     } catch (RuntimeException e) {
@@ -100,26 +103,26 @@ public class SessionManagerTest {
   @Test
   public void testMultipleOperationRequest() {
     TestContext context = prepareRequests(false, 1);
-    SessionManager sessionManager = new SessionManager(1, 1000, context.time(), new MetricRegistry());
+    SessionManager sessionManager = new SessionManager(1, 1000, context.time(), new MetricRegistry(), null);
     HttpServletRequest request = context.request(0);
-    OperationFuture<Integer> future1 = new OperationFuture<>("future1");
-    OperationFuture<String> future2 = new OperationFuture<>("future2");
+    OperationFuture future1 = new OperationFuture("future1");
+    OperationFuture future2 = new OperationFuture("future2");
     for (int i = 0; i < 2; i++) {
       // Create the first future.
-      OperationFuture<Integer> intFuture = sessionManager.getAndCreateSessionIfNotExist(request, () -> future1, 0);
-      assertTrue(intFuture == future1);
-      future1.complete(100);
+      OperationFuture firstFuture = sessionManager.getAndCreateSessionIfNotExist(request, () -> future1, 0);
+      assertSame(firstFuture, future1);
+      future1.complete(new PauseSamplingResult());
       // create the second future.
-      OperationFuture<String> stringFuture = sessionManager.getAndCreateSessionIfNotExist(request, () -> future2, 1);
-      assertTrue(stringFuture == future2);
-      future2.complete("abc");
+      OperationFuture secondFuture = sessionManager.getAndCreateSessionIfNotExist(request, () -> future2, 1);
+      assertSame(secondFuture, future2);
+      future2.complete(new ResumeSamplingResult());
     }
   }
 
   @Test (expected = IllegalArgumentException.class)
   public void testSkipStep() {
     TestContext context = prepareRequests(false, 1);
-    SessionManager sessionManager = new SessionManager(1, 1000, context.time(), new MetricRegistry());
+    SessionManager sessionManager = new SessionManager(1, 1000, context.time(), new MetricRegistry(), null);
     HttpServletRequest request = context.request(0);
     sessionManager.getAndCreateSessionIfNotExist(request, () -> null, 1);
   }

@@ -35,11 +35,14 @@ public class ExecutionTaskManager {
   private final ExecutionTaskTracker _executionTaskTracker;
   private final Set<TopicPartition> _inProgressPartitions;
   private final ExecutionTaskPlanner _executionTaskPlanner;
-  private final int _partitionMovementConcurrency;
-  private final int _leadershipMovementConcurrency;
+  private final int _defaultPartitionMovementConcurrency;
+  private final int _defaultLeadershipMovementConcurrency;
+  private Integer _requestedPartitionMovementConcurrency;
+  private Integer _requestedLeadershipMovementConcurrency;
   private final Set<Integer> _brokersToSkipConcurrencyCheck;
   private final Time _time;
   private volatile long _inExecutionDataToMove;
+  private boolean _isKafkaAssignerMode;
 
   private static final String REPLICA_ACTION = "replica-action";
   private static final String LEADERSHIP_ACTION = "leadership-action";
@@ -48,6 +51,8 @@ public class ExecutionTaskManager {
   private static final String ABORTING = "aborting";
   private static final String ABORTED = "aborted";
   private static final String DEAD = "dead";
+  private static final String ONGOING_EXECUTION = "ongoing-execution";
+  private static final String KAFKA_ASSIGNER_MODE = "kafka_assigner";
 
   private static final String GAUGE_REPLICA_ACTION_IN_PROGRESS = REPLICA_ACTION + "-" + IN_PROGRESS;
   private static final String GAUGE_LEADERSHIP_ACTION_IN_PROGRESS = LEADERSHIP_ACTION + "-" + IN_PROGRESS;
@@ -59,31 +64,70 @@ public class ExecutionTaskManager {
   private static final String GAUGE_LEADERSHIP_ACTION_ABORTED = LEADERSHIP_ACTION + "-" + ABORTED;
   private static final String GAUGE_REPLICA_ACTION_DEAD = REPLICA_ACTION + "-" + DEAD;
   private static final String GAUGE_LEADERSHIP_ACTION_DEAD = LEADERSHIP_ACTION + "-" + DEAD;
+  private static final String GAUGE_ONGOING_EXECUTION_IN_KAFKA_ASSIGNER_MODE = ONGOING_EXECUTION + "-"  + KAFKA_ASSIGNER_MODE;
+  private static final String GAUGE_ONGOING_EXECUTION_IN_NON_KAFKA_ASSIGNER_MODE = ONGOING_EXECUTION + "-non-"  + KAFKA_ASSIGNER_MODE;
 
   /**
    * The constructor of The Execution task manager.
    *
-   * @param partitionMovementConcurrency The maximum number of concurrent partition movements per broker.
-   * @param leadershipMovementConcurrency The maximum number of concurrent leadership movements per batch.
+   * @param defaultPartitionMovementConcurrency The maximum number of concurrent partition movements per broker. It can
+   *                                            be overwritten by user parameter upon post request.
+   * @param defaultLeadershipMovementConcurrency The maximum number of concurrent leadership movements per batch. It can
+   *                                             be overwritten by user parameter upon post request.
+   * @param replicaMovementStrategies The strategies used to determine the execution order of replica movement tasks.
    * @param dropwizardMetricRegistry The metric registry.
    * @param time The time object to get the time.
    */
-  public ExecutionTaskManager(int partitionMovementConcurrency,
-                              int leadershipMovementConcurrency,
+  public ExecutionTaskManager(int defaultPartitionMovementConcurrency,
+                              int defaultLeadershipMovementConcurrency,
+                              List<String> replicaMovementStrategies,
                               MetricRegistry dropwizardMetricRegistry,
                               Time time) {
     _inProgressReplicaMovementsByBrokerId = new HashMap<>();
     _inProgressPartitions = new HashSet<>();
     _executionTaskTracker = new ExecutionTaskTracker();
-    _executionTaskPlanner = new ExecutionTaskPlanner();
-    _partitionMovementConcurrency = partitionMovementConcurrency;
-    _leadershipMovementConcurrency = leadershipMovementConcurrency;
+    _executionTaskPlanner = new ExecutionTaskPlanner(replicaMovementStrategies);
+    _defaultPartitionMovementConcurrency = defaultPartitionMovementConcurrency;
+    _defaultLeadershipMovementConcurrency = defaultLeadershipMovementConcurrency;
     _brokersToSkipConcurrencyCheck = new HashSet<>();
     _inExecutionDataToMove = 0L;
     _time = time;
+    _isKafkaAssignerMode = false;
+    _requestedPartitionMovementConcurrency = null;
+    _requestedLeadershipMovementConcurrency = null;
 
     // Register gauge sensors.
     registerGaugeSensors(dropwizardMetricRegistry);
+  }
+
+  /**
+   * Dynamically set the partition movement concurrency per broker.
+   *
+   * @param requestedPartitionMovementConcurrency The maximum number of concurrent partition movements per broker
+   *                                              (if null, use {@link #_defaultPartitionMovementConcurrency}).
+   */
+  public synchronized void setRequestedPartitionMovementConcurrency(Integer requestedPartitionMovementConcurrency) {
+    _requestedPartitionMovementConcurrency = requestedPartitionMovementConcurrency;
+  }
+
+  /**
+   * Dynamically set the leadership movement concurrency.
+   *
+   * @param requestedLeadershipMovementConcurrency The maximum number of concurrent leader movements
+   *                                               (if null, {@link #_defaultLeadershipMovementConcurrency}).
+   */
+  public synchronized void setRequestedLeadershipMovementConcurrency(Integer requestedLeadershipMovementConcurrency) {
+    _requestedLeadershipMovementConcurrency = requestedLeadershipMovementConcurrency;
+  }
+
+  public synchronized int partitionMovementConcurrency() {
+    return _requestedPartitionMovementConcurrency == null ? _defaultPartitionMovementConcurrency
+                                                          : _requestedPartitionMovementConcurrency;
+  }
+
+  public synchronized int leadershipMovementConcurrency() {
+    return _requestedLeadershipMovementConcurrency == null ? _defaultLeadershipMovementConcurrency
+                                                           : _requestedLeadershipMovementConcurrency;
   }
 
   /**
@@ -111,6 +155,10 @@ public class ExecutionTaskManager {
                                       (Gauge<Integer>) _executionTaskTracker::numDeadReplicaAction);
     dropwizardMetricRegistry.register(MetricRegistry.name(metricName, GAUGE_LEADERSHIP_ACTION_DEAD),
                                       (Gauge<Integer>) _executionTaskTracker::numDeadLeadershipAction);
+    dropwizardMetricRegistry.register(MetricRegistry.name(metricName, GAUGE_ONGOING_EXECUTION_IN_KAFKA_ASSIGNER_MODE),
+                                      (Gauge<Integer>) _executionTaskTracker::isOngoingExecutionInKafkaAssignerMode);
+    dropwizardMetricRegistry.register(MetricRegistry.name(metricName, GAUGE_ONGOING_EXECUTION_IN_NON_KAFKA_ASSIGNER_MODE),
+                                      (Gauge<Integer>) _executionTaskTracker::isOngoingExecutionInNonKafkaAssignerMode);
   }
 
   /**
@@ -118,6 +166,7 @@ public class ExecutionTaskManager {
    */
   public synchronized List<ExecutionTask> getReplicaMovementTasks() {
     Map<Integer, Integer> readyBrokers = new HashMap<>();
+    int partitionMovementConcurrency = partitionMovementConcurrency();
     for (Map.Entry<Integer, Integer> entry : _inProgressReplicaMovementsByBrokerId.entrySet()) {
       // We skip the concurrency level check if caller requested so.
       // This is useful when we detected a broker failure and want to move all its partitions to the
@@ -125,7 +174,7 @@ public class ExecutionTaskManager {
       if (_brokersToSkipConcurrencyCheck.contains(entry.getKey())) {
         readyBrokers.put(entry.getKey(), Integer.MAX_VALUE);
       } else {
-        readyBrokers.put(entry.getKey(), Math.max(0, _partitionMovementConcurrency - entry.getValue()));
+        readyBrokers.put(entry.getKey(), Math.max(0, partitionMovementConcurrency - entry.getValue()));
       }
     }
     return _executionTaskPlanner.getReplicaMovementTasks(readyBrokers, _inProgressPartitions);
@@ -135,7 +184,7 @@ public class ExecutionTaskManager {
    * Returns a list of proposals that move the leadership.
    */
   public synchronized List<ExecutionTask> getLeadershipMovementTasks() {
-    return _executionTaskPlanner.getLeadershipMovementTasks(_leadershipMovementConcurrency);
+    return _executionTaskPlanner.getLeadershipMovementTasks(leadershipMovementConcurrency());
   }
 
   /**
@@ -244,6 +293,9 @@ public class ExecutionTaskManager {
         _inProgressReplicaMovementsByBrokerId.putIfAbsent(broker, 0);
       }
     }
+    // Set the execution mode for tasks.
+    _executionTaskTracker.setExecutionMode(_isKafkaAssignerMode);
+
     // Add pending proposals to indicate the phase before they become an executable task.
     _executionTaskTracker.taskForReplicaAction(ExecutionTask.State.PENDING)
                          .addAll(_executionTaskPlanner.remainingReplicaMovements());
@@ -253,6 +305,15 @@ public class ExecutionTaskManager {
     if (brokersToSkipConcurrencyCheck != null) {
       _brokersToSkipConcurrencyCheck.addAll(brokersToSkipConcurrencyCheck);
     }
+  }
+
+  /**
+   * Set the execution mode of the tasks to keep track of the ongoing execution mode via sensors.
+   *
+   * @param isKafkaAssignerMode True if kafka assigner mode, false otherwise.
+   */
+  public synchronized void setExecutionModeForTaskTracker(boolean isKafkaAssignerMode) {
+    _isKafkaAssignerMode = isKafkaAssignerMode;
   }
 
   /**

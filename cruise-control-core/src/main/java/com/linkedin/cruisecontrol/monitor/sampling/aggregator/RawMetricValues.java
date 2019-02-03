@@ -106,8 +106,10 @@ public class RawMetricValues extends WindowIndexedArrays {
         }
       }
     }
-    LOG.trace("Added metric sample {} to window index {}, actual index is {}, current count : {}",
-              sample, windowIndex, idx, _counts[idx]);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Added metric sample {} to window index {}, actual index is {}, current count : {}",
+                sample, windowIndex, idx, _counts[idx]);
+    }
   }
 
   /**
@@ -185,21 +187,27 @@ public class RawMetricValues extends WindowIndexedArrays {
    *
    * @param startingWindowIndex the starting index of the windows to reset.
    * @param numWindowIndexesToReset the number of windows to reset.
+   * @return number of samples abandoned in window clearing process. The abandoned samples are samples in the windows which get reset.
    */
-  public synchronized void resetWindowIndexes(long startingWindowIndex, int numWindowIndexesToReset) {
+  public synchronized int resetWindowIndexes(long startingWindowIndex, int numWindowIndexesToReset) {
     if (inValidRange(startingWindowIndex)
         || inValidRange(startingWindowIndex + numWindowIndexesToReset - 1)) {
       throw new IllegalStateException("Should never reset a window index that is in the valid range");
     }
-    LOG.debug("Resetting window index [{}, {}]", startingWindowIndex,
-              startingWindowIndex + numWindowIndexesToReset - 1);
     // We are not resetting all the data here. The data will be interpreted to 0 if count is 0.
+    int numAbandonedSamples = 0;
     for (long i = startingWindowIndex; i < startingWindowIndex + numWindowIndexesToReset; i++) {
       int index = arrayIndex(i);
+      numAbandonedSamples += _counts[index];
       _counts[index] = 0;
       _validity.clear(index);
       _extrapolations.clear(index);
     }
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Resetting window index [{}, {}], abandon {} samples.", startingWindowIndex,
+                startingWindowIndex + numWindowIndexesToReset - 1, numAbandonedSamples);
+    }
+    return numAbandonedSamples;
   }
 
   /**

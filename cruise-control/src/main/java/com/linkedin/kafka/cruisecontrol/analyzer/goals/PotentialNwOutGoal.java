@@ -5,6 +5,7 @@
 
 package com.linkedin.kafka.cruisecontrol.analyzer.goals;
 
+import com.linkedin.kafka.cruisecontrol.analyzer.OptimizationOptions;
 import com.linkedin.kafka.cruisecontrol.common.Resource;
 import com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance;
 import com.linkedin.kafka.cruisecontrol.analyzer.BalancingConstraint;
@@ -56,15 +57,6 @@ public class PotentialNwOutGoal extends AbstractGoal {
    */
   PotentialNwOutGoal(BalancingConstraint constraint) {
     _balancingConstraint = constraint;
-  }
-
-  /**
-   * @deprecated
-   * Please use {@link #actionAcceptance(BalancingAction, ClusterModel)} instead.
-   */
-  @Override
-  public boolean isActionAcceptable(BalancingAction action, ClusterModel clusterModel) {
-    return actionAcceptance(action, clusterModel) == ACCEPT;
   }
 
   /**
@@ -256,23 +248,25 @@ public class PotentialNwOutGoal extends AbstractGoal {
    * @param broker         Broker to be balanced.
    * @param clusterModel   The state of the cluster.
    * @param optimizedGoals Optimized goals.
-   * @param excludedTopics The topics that should be excluded from the optimization action.
+   * @param optimizationOptions Options to take into account during optimization -- e.g. excluded topics.
    */
   @Override
   protected void rebalanceForBroker(Broker broker,
                                     ClusterModel clusterModel,
                                     Set<Goal> optimizedGoals,
-                                    Set<String> excludedTopics) {
-    double capacityLimit = broker.capacityFor(Resource.NW_OUT) * _balancingConstraint.capacityThreshold(Resource.NW_OUT);
+                                    OptimizationOptions optimizationOptions) {
+    double capacityThreshold = _balancingConstraint.capacityThreshold(Resource.NW_OUT);
+    double capacityLimit = broker.capacityFor(Resource.NW_OUT) * capacityThreshold;
     boolean estimatedMaxPossibleNwOutOverLimit = !broker.replicas().isEmpty() &&
         clusterModel.potentialLeadershipLoadFor(broker.id()).expectedUtilizationFor(Resource.NW_OUT) > capacityLimit;
     if (!estimatedMaxPossibleNwOutOverLimit) {
       // Estimated max possible utilization in broker is under the limit.
       return;
     }
+    Set<String> excludedTopics = optimizationOptions.excludedTopics();
     // Get candidate brokers
     Set<Broker> candidateBrokers = _selfHealingDeadBrokersOnly ?
-        clusterModel.healthyBrokers() : brokersUnderEstimatedMaxPossibleNwOut(clusterModel);
+        clusterModel.aliveBrokers() : brokersUnderEstimatedMaxPossibleNwOut(clusterModel);
     // Attempt to move replicas to eligible brokers until either the estimated max possible network out
     // limit requirement is satisfied for the broker or all replicas are checked.
     SortedSet<Replica> replicas = new TreeSet<>(broker.replicas());
@@ -288,7 +282,7 @@ public class PotentialNwOutGoal extends AbstractGoal {
                                                       b1.leadershipLoadForNwResources().expectedUtilizationFor(Resource.NW_OUT)));
       Broker destinationBroker =
           maybeApplyBalancingAction(clusterModel, replica, eligibleBrokers, ActionType.REPLICA_MOVEMENT,
-                                    optimizedGoals);
+                                    optimizedGoals, optimizationOptions);
       if (destinationBroker != null) {
         int destinationBrokerId = destinationBroker.id();
         // Check if broker capacity limit is satisfied now.
@@ -300,7 +294,8 @@ public class PotentialNwOutGoal extends AbstractGoal {
         // Update brokersUnderEstimatedMaxPossibleNwOut (for destination broker).
         double updatedDestBrokerPotentialNwOut =
             clusterModel.potentialLeadershipLoadFor(destinationBrokerId).expectedUtilizationFor(Resource.NW_OUT);
-        if (!_selfHealingDeadBrokersOnly && updatedDestBrokerPotentialNwOut > capacityLimit) {
+        double destCapacityLimit = destinationBroker.capacityFor(Resource.NW_OUT) * capacityThreshold;
+        if (!_selfHealingDeadBrokersOnly && updatedDestBrokerPotentialNwOut > destCapacityLimit) {
           candidateBrokers.remove(clusterModel.broker(destinationBrokerId));
         }
       }
@@ -325,11 +320,10 @@ public class PotentialNwOutGoal extends AbstractGoal {
     Set<Broker> brokersUnderEstimatedMaxPossibleNwOut = new HashSet<>();
     double capacityThreshold = _balancingConstraint.capacityThreshold(Resource.NW_OUT);
 
-    for (Broker healthyBroker : clusterModel.healthyBrokers()) {
-      // We use the hosts capacity instead of the broker capacity.
-      double capacityLimit = healthyBroker.host().capacityFor(Resource.NW_OUT) * capacityThreshold;
-      if (clusterModel.potentialLeadershipLoadFor(healthyBroker.id()).expectedUtilizationFor(Resource.NW_OUT) < capacityLimit) {
-        brokersUnderEstimatedMaxPossibleNwOut.add(healthyBroker);
+    for (Broker aliveBroker : clusterModel.aliveBrokers()) {
+      double capacityLimit = aliveBroker.capacityFor(Resource.NW_OUT) * capacityThreshold;
+      if (clusterModel.potentialLeadershipLoadFor(aliveBroker.id()).expectedUtilizationFor(Resource.NW_OUT) < capacityLimit) {
+        brokersUnderEstimatedMaxPossibleNwOut.add(aliveBroker);
       }
     }
     return brokersUnderEstimatedMaxPossibleNwOut;

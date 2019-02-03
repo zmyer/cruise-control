@@ -4,6 +4,7 @@
 
 package com.linkedin.kafka.cruisecontrol.async;
 
+import com.linkedin.kafka.cruisecontrol.servlet.response.CruiseControlResponse;
 import com.linkedin.kafka.cruisecontrol.KafkaCruiseControl;
 import com.linkedin.kafka.cruisecontrol.async.progress.OperationStep;
 import com.linkedin.kafka.cruisecontrol.async.progress.Pending;
@@ -14,14 +15,13 @@ import org.slf4j.LoggerFactory;
 
 /**
  * An abstract class for the async operation runnables.
- * @param <T>
  */
-abstract class OperationRunnable<T> implements Runnable {
+abstract class OperationRunnable implements Runnable {
   private static final Logger LOG = LoggerFactory.getLogger(OperationRunnable.class);
   protected final KafkaCruiseControl _kafkaCruiseControl;
-  protected final OperationFuture<T> _future;
+  protected final OperationFuture _future;
 
-  OperationRunnable(KafkaCruiseControl kafkaCruiseControl, OperationFuture<T> future) {
+  OperationRunnable(KafkaCruiseControl kafkaCruiseControl, OperationFuture future) {
     _kafkaCruiseControl = kafkaCruiseControl;
     _future = future;
   }
@@ -29,7 +29,7 @@ abstract class OperationRunnable<T> implements Runnable {
   /**
    * @return the corresponding {@link OperationFuture} for the runnable.
    */
-  protected OperationFuture<T> future() {
+  protected OperationFuture future() {
     return _future;
   }
 
@@ -43,6 +43,8 @@ abstract class OperationRunnable<T> implements Runnable {
           ((Pending) steps.get(0)).done();
         }
         _future.complete(getResult());
+        // If operation completes successfully (i.e with no exception thrown), record the operation finish time.
+        _future.setFinishTimeNs(System.nanoTime());
       }
     } catch (Exception e) {
       LOG.debug("Received exception when trying to execute runnable for \"" + _future.operation() + "\"", e);
@@ -54,5 +56,5 @@ abstract class OperationRunnable<T> implements Runnable {
     }
   }
 
-  protected abstract T getResult() throws Exception;
+  protected abstract CruiseControlResponse getResult() throws Exception;
 }

@@ -27,6 +27,8 @@ import org.apache.kafka.common.TopicPartition;
  * replicas. A rack object is created as part of a cluster structure.
  */
 public class Rack implements Serializable {
+  private static final String RACK_ID = "rackid";
+  private static final String HOSTS = "hosts";
   private static final long serialVersionUID = 6866290448556002509L;
   private final String _id;
   private final Map<String, Host> _hosts;
@@ -130,7 +132,7 @@ public class Rack implements Serializable {
    * brokers in the rack for the requested resource.
    *
    * @param resource Resource for which capacity will be provided.
-   * @return Healthy rack capacity of the resource.
+   * @return Alive rack capacity of the resource.
    */
   public double capacityFor(Resource resource) {
     return _rackCapacity[resource.id()];
@@ -244,8 +246,8 @@ public class Rack implements Serializable {
   /**
    * Create a broker under this rack, and get the created broker.
    *
-   * @param brokerId       Id of the broker to be created.
-   * @param hostName           The hostName of the broker
+   * @param brokerId Id of the broker to be created.
+   * @param hostName The hostName of the broker
    * @param brokerCapacity Capacity of the created broker.
    * @return Created broker.
    */
@@ -269,7 +271,9 @@ public class Rack implements Serializable {
     for (Resource r : Resource.cachedValues()) {
       double capacity = 0;
       for (Host h : _hosts.values()) {
-        capacity += h.capacityFor(r);
+        if (h.isAlive()) {
+          capacity += h.capacityFor(r);
+        }
       }
       _rackCapacity[r.id()] = capacity;
     }
@@ -285,8 +289,8 @@ public class Rack implements Serializable {
       hostList.add(host.getJsonStructure());
     }
     Map<String, Object> rackMap = new HashMap<>();
-    rackMap.put("rackid", _id);
-    rackMap.put("hosts", hostList);
+    rackMap.put(RACK_ID, _id);
+    rackMap.put(HOSTS, hostList);
     return rackMap;
   }
 

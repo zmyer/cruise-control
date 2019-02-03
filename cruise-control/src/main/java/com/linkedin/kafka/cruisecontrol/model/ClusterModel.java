@@ -4,13 +4,14 @@
 
 package com.linkedin.kafka.cruisecontrol.model;
 
-import com.google.gson.Gson;
 import com.linkedin.cruisecontrol.monitor.sampling.aggregator.AggregatedMetricValues;
 import com.linkedin.kafka.cruisecontrol.common.Resource;
 import com.linkedin.kafka.cruisecontrol.analyzer.BalancingConstraint;
 import com.linkedin.kafka.cruisecontrol.analyzer.AnalyzerUtils;
 
+import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityInfo;
 import com.linkedin.kafka.cruisecontrol.monitor.ModelGeneration;
+import com.linkedin.kafka.cruisecontrol.servlet.response.stats.BrokerStats;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.Serializable;
@@ -26,11 +27,12 @@ import java.util.SortedSet;
 import java.util.TreeSet;
 import java.util.SortedMap;
 import java.util.TreeMap;
-import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import org.apache.commons.math3.stat.descriptive.moment.Variance;
 import org.apache.kafka.common.TopicPartition;
+
 
 /**
  * A class that holds the information of the cluster, including topology, liveness and load for racks, brokers and
@@ -46,8 +48,8 @@ public class ClusterModel implements Serializable {
   private final Map<TopicPartition, Partition> _partitionsByTopicPartition;
   private final Set<Replica> _selfHealingEligibleReplicas;
   private final SortedSet<Broker> _newBrokers;
-  private final Set<Broker> _healthyBrokers;
-  private final SortedSet<Broker> _deadBrokes;
+  private final Set<Broker> _aliveBrokers;
+  private final SortedSet<Broker> _deadBrokers;
   private final SortedSet<Broker> _brokers;
   private final double _monitoredPartitionsPercentage;
   private final double[] _clusterCapacity;
@@ -58,6 +60,7 @@ public class ClusterModel implements Serializable {
   private Map<String, Integer> _replicationFactorByTopic;
   private Map<Integer, Load> _potentialLeadershipLoadByBrokerId;
   private int _unknownHostId;
+  private Map<Integer, String> _capacityEstimationInfoByBrokerId;
 
   /**
    * Constructor for the cluster class. It creates data structures to hold a list of racks, a map for partitions by
@@ -73,12 +76,12 @@ public class ClusterModel implements Serializable {
     _selfHealingEligibleReplicas = new HashSet<>();
     // A sorted set of newly added brokers
     _newBrokers = new TreeSet<>();
-    // A set of healthy brokers
-    _healthyBrokers = new HashSet<>();
+    // A set of alive brokers
+    _aliveBrokers = new HashSet<>();
     // A set of all brokers
     _brokers = new TreeSet<>();
     // A set of dead brokers
-    _deadBrokes = new TreeSet<>();
+    _deadBrokers = new TreeSet<>();
     // Initially cluster does not contain any load.
     _load = new Load();
     _clusterCapacity = new double[Resource.cachedValues().size()];
@@ -87,6 +90,7 @@ public class ClusterModel implements Serializable {
     _potentialLeadershipLoadByBrokerId = new HashMap<>();
     _monitoredPartitionsPercentage = monitoredPartitionsPercentage;
     _unknownHostId = 0;
+    _capacityEstimationInfoByBrokerId = new HashMap<>();
   }
 
   /**
@@ -127,13 +131,12 @@ public class ClusterModel implements Serializable {
    * @return The replica distribution of leader and follower replicas in the cluster at the point of call.
    */
   public Map<TopicPartition, List<Integer>> getReplicaDistribution() {
-    Map<TopicPartition, List<Integer>> replicaDistribution = new HashMap<>();
+    Map<TopicPartition, List<Integer>> replicaDistribution = new HashMap<>(_partitionsByTopicPartition.size());
 
     for (Map.Entry<TopicPartition, Partition> entry : _partitionsByTopicPartition.entrySet()) {
       TopicPartition tp = entry.getKey();
       Partition partition = entry.getValue();
-      List<Integer> brokerIds = new ArrayList<>();
-      partition.replicas().forEach(r -> brokerIds.add(r.broker().id()));
+      List<Integer> brokerIds = partition.replicas().stream().map(r -> r.broker().id()).collect(Collectors.toList());
       // Add distribution of replicas in the partition.
       replicaDistribution.put(tp, brokerIds);
     }
@@ -145,7 +148,7 @@ public class ClusterModel implements Serializable {
    * Get leader broker ids for each partition.
    */
   public Map<TopicPartition, Integer> getLeaderDistribution() {
-    Map<TopicPartition, Integer> leaders = new HashMap<>();
+    Map<TopicPartition, Integer> leaders = new HashMap<>(_partitionsByTopicPartition.size());
     for (Map.Entry<TopicPartition, Partition> entry : _partitionsByTopicPartition.entrySet()) {
       leaders.put(entry.getKey(), entry.getValue().leader().broker().id());
     }
@@ -223,11 +226,13 @@ public class ClusterModel implements Serializable {
   }
 
   /**
-   * Set broker alive status. If broker is not alive, add its replicas to self healing eligible replicas, if broker
-   * alive status is set to true, remove its replicas from self healing eligible replicas.
+   * Set the {@link Broker.State liveness state} of the given broker.
+   * <ul>
+   * <li>Replicas on dead brokers are considered to be self healing eligible.</li>
+   * </ul>
    *
-   * @param brokerId    Id of the broker for which the alive status is set.
-   * @param newState True if alive, false otherwise.
+   * @param brokerId Id of the broker for which the alive status is set.
+   * @param newState The new state of the broker.
    */
   public void setBrokerState(int brokerId, Broker.State newState) {
     Broker broker = broker(brokerId);
@@ -240,8 +245,8 @@ public class ClusterModel implements Serializable {
     switch (newState) {
       case DEAD:
         _selfHealingEligibleReplicas.addAll(broker.replicas());
-        _healthyBrokers.remove(broker);
-        _deadBrokes.add(broker);
+        _aliveBrokers.remove(broker);
+        _deadBrokers.add(broker);
         break;
       case NEW:
         _newBrokers.add(broker);
@@ -250,8 +255,8 @@ public class ClusterModel implements Serializable {
         // As of now we still treat demoted brokers as alive brokers.
       case ALIVE:
         _selfHealingEligibleReplicas.removeAll(broker.replicas());
-        _healthyBrokers.add(broker);
-        _deadBrokes.remove(broker);
+        _aliveBrokers.add(broker);
+        _deadBrokers.remove(broker);
         break;
       default:
         throw new IllegalArgumentException("Illegal broker state " + newState + " is provided.");
@@ -331,17 +336,24 @@ public class ClusterModel implements Serializable {
   }
 
   /**
-   * Get healthy brokers in the cluster.
+   * Get alive brokers in the cluster.
    */
-  public Set<Broker> healthyBrokers() {
-    return _healthyBrokers;
+  public Set<Broker> aliveBrokers() {
+    return _aliveBrokers;
   }
 
   /**
    * Get the dead brokers in the cluster.
    */
   public SortedSet<Broker> deadBrokers() {
-    return new TreeSet<>(_deadBrokes);
+    return new TreeSet<>(_deadBrokers);
+  }
+
+  /**
+   * @return Capacity estimation info by broker id for which there has been an estimation.
+   */
+  public Map<Integer, String> capacityEstimationInfoByBrokerId() {
+    return Collections.unmodifiableMap(_capacityEstimationInfoByBrokerId);
   }
 
   /**
@@ -430,6 +442,96 @@ public class ClusterModel implements Serializable {
   }
 
   /**
+   * Ask the cluster model to keep track of the replicas sorted with the given score function.
+   *
+   * It is recommended to use the functions from {@link ReplicaSortFunctionFactory} so the functions can be maintained
+   * in a single place.
+   *
+   * The sorted replica will only be updated in the following cases:
+   * 1. A replica is added to or removed from a broker
+   * 2. A replica's role has changed from leader to follower, and vice versa.
+   *
+   * The sorted replicas are named using the given sortName, and can be accessed using
+   * {@link Broker#trackedSortedReplicas(String)}. If the sorted replicas are no longer needed,
+   * {@link #untrackSortedReplicas(String)} to release memory.
+   *
+   * @param sortName the name of the sorted replicas.
+   * @param scoreFunction the score function to sort the replicas with the same priority.
+   * @see SortedReplicas
+   */
+  public void trackSortedReplicas(String sortName, Function<Replica, Double> scoreFunction) {
+    trackSortedReplicas(sortName, null, scoreFunction);
+  }
+
+  /**
+   * Ask the cluster model to keep track of the replicas sorted with the given priority function and score function.
+   *
+   * It is recommended to use the functions from {@link ReplicaSortFunctionFactory} so the functions can be maintained
+   * in a single place.
+   *
+   * The sort will first use the priority function then the score function. The priority function allows the
+   * caller to prioritize a certain type of replicas, e.g immigrant replicas.
+   *
+   * The sorted replica will only be updated in the following cases:
+   * 1. A replica is added to or removed from abroker
+   * 2. A replica's role has changed from leader to follower, and vice versa.
+   *
+   * The sorted replicas are named using the given sortName, and can be accessed using
+   * {@link Broker#trackedSortedReplicas(String)}. If the sorted replicas are no longer needed,
+   * {@link #untrackSortedReplicas(String)} to release memory.
+   *
+   * @param sortName the name of the sorted replicas.
+   * @param priorityFunc the priority function to sort the replicas
+   * @param scoreFunc the score function to sort the replicas with the same priority.
+   * @see SortedReplicas
+   */
+  public void trackSortedReplicas(String sortName,
+                                  Function<Replica, Integer> priorityFunc,
+                                  Function<Replica, Double> scoreFunc) {
+    trackSortedReplicas(sortName, null, priorityFunc, scoreFunc);
+  }
+
+  /**
+   * Ask the cluster model to keep track of the replicas sorted with the given priority function and score function.
+   *
+   * The sort will first use the priority function then the score function. The priority function allows the
+   * caller to prioritize a certain type of replicas, e.g immigrant replicas. The selection function determines
+   * which replicas to be included in the sorted replicas.
+   *
+   * It is recommended to use the functions from {@link ReplicaSortFunctionFactory} so the functions can be maintained
+   * in a single place.
+   *
+   * The sorted replica will only be updated in the following cases:
+   * 1. A replica is added to or removed from a broker
+   * 2. A replica's role has changed from leader to follower, and vice versa.
+   *
+   * The sorted replicas are named using the given sortName, and can be accessed using
+   * {@link Broker#trackedSortedReplicas(String)}. If the sorted replicas are no longer needed,
+   * {@link #untrackSortedReplicas(String)} to release memory.
+   *
+   * @param sortName the name of the sorted replicas.
+   * @param selectionFunc the selection function to decide which replicas to include in the sort.
+   * @param priorityFunc the priority function to sort the replicas
+   * @param scoreFunc the score function to sort the replicas with the same priority.
+   * @see SortedReplicas
+   */
+  public void trackSortedReplicas(String sortName,
+                                  Function<Replica, Boolean> selectionFunc,
+                                  Function<Replica, Integer> priorityFunc,
+                                  Function<Replica, Double> scoreFunc) {
+    _brokers.forEach(b -> b.trackSortedReplicas(sortName, selectionFunc, priorityFunc, scoreFunc));
+  }
+
+  /**
+   * Untrack the sorted replicas with the given name to release memory.
+   *
+   * @param sortName the name of the sorted replicas.
+   */
+  public void untrackSortedReplicas(String sortName) {
+    _brokers.forEach(b -> b.untrackSortedReplicas(sortName));
+  }
+
+  /**
    * Clear the content and structure of the cluster.
    */
   public void clear() {
@@ -438,19 +540,20 @@ public class ClusterModel implements Serializable {
     _load.clearLoad();
     _maxReplicationFactor = 1;
     _replicationFactorByTopic.clear();
+    _capacityEstimationInfoByBrokerId.clear();
   }
 
   /**
-   * Get number of healthy racks in the cluster.
+   * Get number of alive racks in the cluster.
    */
-  public int numHealthyRacks() {
-    int numHealthyRacks = 0;
+  public int numAliveRacks() {
+    int numAliveRacks = 0;
     for (Rack rack : _racksById.values()) {
       if (rack.isRackAlive()) {
-        numHealthyRacks++;
+        numAliveRacks++;
       }
     }
-    return numHealthyRacks;
+    return numAliveRacks;
   }
 
   /**
@@ -485,7 +588,7 @@ public class ClusterModel implements Serializable {
    * brokers in the cluster for the requested resource.
    *
    * @param resource Resource for which the capacity will be provided.
-   * @return Healthy cluster capacity of the resource.
+   * @return Alive cluster capacity of the resource.
    */
   public double capacityFor(Resource resource) {
     return _clusterCapacity[resource.id()];
@@ -532,14 +635,14 @@ public class ClusterModel implements Serializable {
    *
    * @param rackId         Rack id under which the replica will be created.
    * @param brokerId       Broker id under which the replica will be created.
-   * @param brokerCapacity The broker capacity to use if the broker does not exist.
+   * @param brokerCapacityInfo The capacity information to use if the broker does not exist.
    */
-  public void handleDeadBroker(String rackId, int brokerId, Map<Resource, Double> brokerCapacity) {
+  public void handleDeadBroker(String rackId, int brokerId, BrokerCapacityInfo brokerCapacityInfo) {
     if (rack(rackId) == null) {
       createRack(rackId);
     }
     if (broker(brokerId) == null) {
-      createBroker(rackId, String.format("UNKNOWN_HOST-%d", _unknownHostId++), brokerId, brokerCapacity);
+      createBroker(rackId, String.format("UNKNOWN_HOST-%d", _unknownHostId++), brokerId, brokerCapacityInfo);
     }
   }
 
@@ -579,7 +682,7 @@ public class ClusterModel implements Serializable {
     }
 
     // Keep track of the replication factor per topic.
-    Integer replicationFactor = Math.max(_replicationFactorByTopic.get(tp.topic()), partition.followers().size() + 1);
+    int replicationFactor = Math.max(_replicationFactorByTopic.get(tp.topic()), partition.followers().size() + 1);
     _replicationFactorByTopic.put(tp.topic(), replicationFactor);
 
     // Increment the maximum replication factor if the number of replicas of the partition is larger than the
@@ -591,19 +694,24 @@ public class ClusterModel implements Serializable {
 
   /**
    * Create a broker under this cluster/rack and get the created broker.
+   * Add the broker id and info to {@link #_capacityEstimationInfoByBrokerId} if the broker capacity has been estimated.
    *
-   * @param rackId         Id of the rack that the broker will be created in.
-   * @param host           The host of this broker
-   * @param brokerId       Id of the broker to be created.
-   * @param brokerCapacity Capacity of the created broker.
+   * @param rackId Id of the rack that the broker will be created in.
+   * @param host The host of this broker
+   * @param brokerId Id of the broker to be created.
+   * @param brokerCapacityInfo Capacity information of the created broker.
    * @return Created broker.
    */
-  public Broker createBroker(String rackId, String host, int brokerId, Map<Resource, Double> brokerCapacity) {
+  public Broker createBroker(String rackId, String host, int brokerId, BrokerCapacityInfo brokerCapacityInfo) {
     _potentialLeadershipLoadByBrokerId.putIfAbsent(brokerId, new Load());
     Rack rack = rack(rackId);
     _brokerIdToRack.put(brokerId, rack);
-    Broker broker = rack.createBroker(brokerId, host, brokerCapacity);
-    _healthyBrokers.add(broker);
+
+    if (brokerCapacityInfo.isEstimated()) {
+      _capacityEstimationInfoByBrokerId.put(brokerId, brokerCapacityInfo.estimationInfo());
+    }
+    Broker broker = rack.createBroker(brokerId, host, brokerCapacityInfo.capacity());
+    _aliveBrokers.add(broker);
     _brokers.add(broker);
     refreshCapacity();
     return broker;
@@ -621,28 +729,28 @@ public class ClusterModel implements Serializable {
   }
 
   /**
-   * Get a list of sorted (in ascending order by resource) healthy brokers having utilization under:
+   * Get a list of sorted (in ascending order by resource) alive brokers having utilization under:
    * (given utilization threshold) * (broker and/or host capacity (see {@link Resource#_isHostResource} and
    * {@link Resource#_isBrokerResource}). Utilization threshold might be any capacity constraint thresholds such as
    * balance or capacity.
    *
    * @param resource             Resource for which brokers will be sorted.
    * @param utilizationThreshold Utilization threshold for the given resource.
-   * @return A list of sorted (in ascending order by resource) healthy brokers having utilization under:
+   * @return A list of sorted (in ascending order by resource) alive brokers having utilization under:
    * (given utilization threshold) * (broker and/or host capacity).
    */
-  public List<Broker> sortedHealthyBrokersUnderThreshold(Resource resource, double utilizationThreshold) {
-    List<Broker> sortedTargetBrokersUnderCapacityLimit = healthyBrokersUnderThreshold(resource, utilizationThreshold);
+  public List<Broker> sortedAliveBrokersUnderThreshold(Resource resource, double utilizationThreshold) {
+    List<Broker> sortedTargetBrokersUnderCapacityLimit = aliveBrokersUnderThreshold(resource, utilizationThreshold);
 
     sortedTargetBrokersUnderCapacityLimit.sort((o1, o2) -> {
-      Double expectedBrokerLoad1 = o1.load().expectedUtilizationFor(resource);
-      Double expectedBrokerLoad2 = o2.load().expectedUtilizationFor(resource);
+      double expectedBrokerLoad1 = o1.load().expectedUtilizationFor(resource);
+      double expectedBrokerLoad2 = o2.load().expectedUtilizationFor(resource);
       // For host resource we first compare host util then look at the broker util -- even if a resource is a
       // host-resource, but not broker-resource.
       int hostComparison = 0;
       if (resource.isHostResource()) {
-        Double expectedHostLoad1 = resource.isHostResource() ? o1.host().load().expectedUtilizationFor(resource) : 0.0;
-        Double expectedHostLoad2 = resource.isHostResource() ? o2.host().load().expectedUtilizationFor(resource) : 0.0;
+        double expectedHostLoad1 = o1.host().load().expectedUtilizationFor(resource);
+        double expectedHostLoad2 = o2.host().load().expectedUtilizationFor(resource);
         hostComparison = Double.compare(expectedHostLoad1, expectedHostLoad2);
       }
       return hostComparison == 0 ? Double.compare(expectedBrokerLoad1, expectedBrokerLoad2) : hostComparison;
@@ -650,50 +758,50 @@ public class ClusterModel implements Serializable {
     return sortedTargetBrokersUnderCapacityLimit;
   }
 
-  public List<Broker> healthyBrokersUnderThreshold(Resource resource, double utilizationThreshold) {
-    List<Broker> healthyBrokersUnderThreshold = new ArrayList<>();
+  public List<Broker> aliveBrokersUnderThreshold(Resource resource, double utilizationThreshold) {
+    List<Broker> aliveBrokersUnderThreshold = new ArrayList<>();
 
-    for (Broker healthyBroker : healthyBrokers()) {
+    for (Broker aliveBroker : aliveBrokers()) {
       if (resource.isBrokerResource()) {
-        double brokerCapacityLimit = healthyBroker.capacityFor(resource) * utilizationThreshold;
-        double brokerUtilization = healthyBroker.load().expectedUtilizationFor(resource);
+        double brokerCapacityLimit = aliveBroker.capacityFor(resource) * utilizationThreshold;
+        double brokerUtilization = aliveBroker.load().expectedUtilizationFor(resource);
         if (brokerUtilization >= brokerCapacityLimit) {
           continue;
         }
       }
       if (resource.isHostResource()) {
-        double hostCapacityLimit = healthyBroker.host().capacityFor(resource) * utilizationThreshold;
-        double hostUtilization = healthyBroker.host().load().expectedUtilizationFor(resource);
+        double hostCapacityLimit = aliveBroker.host().capacityFor(resource) * utilizationThreshold;
+        double hostUtilization = aliveBroker.host().load().expectedUtilizationFor(resource);
         if (hostUtilization >= hostCapacityLimit) {
           continue;
         }
       }
-      healthyBrokersUnderThreshold.add(healthyBroker);
+      aliveBrokersUnderThreshold.add(aliveBroker);
     }
-    return healthyBrokersUnderThreshold;
+    return aliveBrokersUnderThreshold;
   }
 
-  public List<Broker> healthyBrokersOverThreshold(Resource resource, double utilizationThreshold) {
-    List<Broker> healthyBrokersOverThreshold = new ArrayList<>();
+  public List<Broker> aliveBrokersOverThreshold(Resource resource, double utilizationThreshold) {
+    List<Broker> aliveBrokersOverThreshold = new ArrayList<>();
 
-    for (Broker healthyBroker : healthyBrokers()) {
+    for (Broker aliveBroker : aliveBrokers()) {
       if (resource.isBrokerResource()) {
-        double brokerCapacityLimit = healthyBroker.capacityFor(resource) * utilizationThreshold;
-        double brokerUtilization = healthyBroker.load().expectedUtilizationFor(resource);
+        double brokerCapacityLimit = aliveBroker.capacityFor(resource) * utilizationThreshold;
+        double brokerUtilization = aliveBroker.load().expectedUtilizationFor(resource);
         if (brokerUtilization <= brokerCapacityLimit) {
           continue;
         }
       }
       if (resource.isHostResource()) {
-        double hostCapacityLimit = healthyBroker.host().capacityFor(resource) * utilizationThreshold;
-        double hostUtilization = healthyBroker.host().load().expectedUtilizationFor(resource);
+        double hostCapacityLimit = aliveBroker.host().capacityFor(resource) * utilizationThreshold;
+        double hostUtilization = aliveBroker.host().load().expectedUtilizationFor(resource);
         if (hostUtilization <= hostCapacityLimit) {
           continue;
         }
       }
-      healthyBrokersOverThreshold.add(healthyBroker);
+      aliveBrokersOverThreshold.add(aliveBroker);
     }
-    return healthyBrokersOverThreshold;
+    return aliveBrokersOverThreshold;
   }
 
   /**
@@ -718,11 +826,10 @@ public class ClusterModel implements Serializable {
    * @return a list of partitions sorted by utilization of the given resource.
    */
   public List<Partition> replicasSortedByUtilization(Resource resource) {
-    List<Partition> partitionList = new ArrayList<>();
-    partitionList.addAll(_partitionsByTopicPartition.values());
+    List<Partition> partitionList = new ArrayList<>(_partitionsByTopicPartition.values());
     partitionList.sort((o1, o2) -> Double.compare(o2.leader().load().expectedUtilizationFor(resource),
                                                   o1.leader().load().expectedUtilizationFor(resource)));
-    return Collections.unmodifiableList(partitionList);
+    return partitionList;
   }
 
   /**
@@ -827,7 +934,7 @@ public class ClusterModel implements Serializable {
         Resource resource = entry.getKey();
         double sumOfHostsUtil = entry.getValue();
         sumOfRackUtilizationByResource.putIfAbsent(resource, 0.0);
-        Double rackUtilization = rack.load().expectedUtilizationFor(resource);
+        double rackUtilization = rack.load().expectedUtilizationFor(resource);
         if (AnalyzerUtils.compare(rackUtilization, sumOfHostsUtil, resource) != 0) {
           throw new IllegalArgumentException(prologueErrorMsg + " Rack utilization for " + resource + " is different "
                                              + "from the total host utilization in rack" + rack.id()
@@ -880,43 +987,6 @@ public class ClusterModel implements Serializable {
     }
   }
 
-  /*
-   * Return an object that can be further used
-   * to encode into JSON
-   */
-  public List<Map<String, Object>> getJsonStructure() {
-    List<Map<String, Object>> finalClusterStats = new ArrayList<>();
-
-    for (Broker broker : brokers()) {
-      double leaderBytesInRate = broker.leadershipLoadForNwResources().expectedUtilizationFor(Resource.NW_IN);
-
-      Map<String, Object> hostEntry = new HashMap<>();
-      hostEntry.put("Host", broker.host().name());
-      hostEntry.put("Broker", broker.id());
-      hostEntry.put("BrokerState", broker.getState());
-      hostEntry.put("DiskMB", AnalyzerUtils.nanToZero(broker.load().expectedUtilizationFor(Resource.DISK)));
-      hostEntry.put("CpuPct", AnalyzerUtils.nanToZero(broker.load().expectedUtilizationFor(Resource.CPU)));
-      hostEntry.put("LeaderNwInRate", AnalyzerUtils.nanToZero(leaderBytesInRate));
-      hostEntry.put("FollowerNwInRate", AnalyzerUtils.nanToZero(broker.load().expectedUtilizationFor(Resource.NW_IN) - leaderBytesInRate));
-      hostEntry.put("NnwOutRate", AnalyzerUtils.nanToZero(broker.load().expectedUtilizationFor(Resource.NW_OUT)));
-      hostEntry.put("PnwOutRate", AnalyzerUtils.nanToZero(potentialLeadershipLoadFor(broker.id()).expectedUtilizationFor(Resource.NW_OUT)));
-      hostEntry.put("Replicas", broker.replicas().size());
-
-      finalClusterStats.add(hostEntry);
-    }
-
-    return finalClusterStats;
-  }
-
-  /**
-   * Get broker level stats in JSON format.
-   */
-  public String brokerStatsJSON() {
-    Gson gson = new Gson();
-    String json = gson.toJson(getJsonStructure());
-    return json;
-  }
-
   /**
    * Get broker return the broker stats.
    */
@@ -926,258 +996,18 @@ public class ClusterModel implements Serializable {
       double leaderBytesInRate = broker.leadershipLoadForNwResources().expectedUtilizationFor(Resource.NW_IN);
       brokerStats.addSingleBrokerStats(broker.host().name(),
                                        broker.id(),
-                                       broker.getState(),
+                                       broker.state(),
                                        broker.replicas().isEmpty() ? 0 : broker.load().expectedUtilizationFor(Resource.DISK),
                                        broker.load().expectedUtilizationFor(Resource.CPU),
                                        leaderBytesInRate,
                                        broker.load().expectedUtilizationFor(Resource.NW_IN) - leaderBytesInRate,
                                        broker.load().expectedUtilizationFor(Resource.NW_OUT),
                                        potentialLeadershipLoadFor(broker.id()).expectedUtilizationFor(Resource.NW_OUT),
-                                       broker.replicas().size(), broker.leaderReplicas().size());
+                                       broker.replicas().size(), broker.leaderReplicas().size(),
+                                       _capacityEstimationInfoByBrokerId.get(broker.id()) != null,
+                                        broker.capacityFor(Resource.DISK));
     });
     return brokerStats;
-  }
-
-  /**
-   * Get broker level stats in human readable format.
-   */
-  public static class BrokerStats {
-    private final List<SingleBrokerStats> _brokerStats = new ArrayList<>();
-    private int _hostFieldLength = 0;
-    private SortedMap<String, BasicStats> _hostStats = new ConcurrentSkipListMap<>();
-
-    private void addSingleBrokerStats(String host, int id, Broker.State state, double diskUtil, double cpuUtil, double leaderBytesInRate,
-                                      double followerBytesInRate, double bytesOutRate, double potentialBytesOutRate,
-                                      int numReplicas, int numLeaders) {
-
-      SingleBrokerStats singleBrokerStats =
-          new SingleBrokerStats(host, id, state, diskUtil, cpuUtil, leaderBytesInRate, followerBytesInRate, bytesOutRate,
-                                potentialBytesOutRate, numReplicas, numLeaders);
-      _brokerStats.add(singleBrokerStats);
-      _hostFieldLength = Math.max(_hostFieldLength, host.length());
-      _hostStats.computeIfAbsent(host, h -> new BasicStats(0.0, 0.0, 0.0, 0.0,
-                                                           0.0, 0.0, 0, 0))
-                .addBasicStats(singleBrokerStats.basicStats());
-    }
-
-    /**
-     * Get the broker level load stats.
-     */
-    public List<SingleBrokerStats> stats() {
-      return _brokerStats;
-    }
-
-    /**
-     * Return a valid JSON encoded string
-     *
-     * @param version JSON version
-     */
-    public String getJSONString(int version) {
-      Gson gson = new Gson();
-      Map<String, Object> jsonStructure = getJsonStructure();
-      jsonStructure.put("version", version);
-      return gson.toJson(jsonStructure);
-    }
-
-    /**
-     * Return an object that can be further used
-     * to encode into JSON
-     */
-    public Map<String, Object> getJsonStructure() {
-      List<Map<String, Object>> hostStats = new ArrayList<>();
-
-      // host level statistics
-      for (Map.Entry<String, BasicStats> entry : _hostStats.entrySet()) {
-        BasicStats stats = entry.getValue();
-        Map<String, Object> hostEntry = entry.getValue().getJSONStructure();
-        hostEntry.put("Host", entry.getKey());
-        hostStats.add(hostEntry);
-      }
-
-      // broker level statistics
-      List<Map<String, Object>> brokerStats = new ArrayList<>();
-      for (SingleBrokerStats stats : _brokerStats) {
-        Map<String, Object> brokerEntry = stats.getJSONStructure();
-        brokerStats.add(brokerEntry);
-      }
-
-      // consolidated
-      Map<String, Object> stats = new HashMap<>();
-      stats.put("hosts", hostStats);
-      stats.put("brokers", brokerStats);
-      return stats;
-    }
-
-    @Override
-    public String toString() {
-      StringBuilder sb = new StringBuilder();
-      // put host stats.
-      sb.append(String.format("%n%" + _hostFieldLength + "s%20s%15s%25s%25s%20s%20s%20s%n",
-                              "HOST", "DISK(MB)", "CPU(%)", "LEADER_NW_IN(KB/s)",
-                              "FOLLOWER_NW_IN(KB/s)", "NW_OUT(KB/s)", "PNW_OUT(KB/s)", "LEADERS/REPLICAS"));
-      for (Map.Entry<String, BasicStats> entry : _hostStats.entrySet()) {
-        BasicStats stats = entry.getValue();
-        sb.append(String.format("%" + _hostFieldLength + "s,%19.3f,%14.3f,%24.3f,%24.3f,%19.3f,%19.3f,%14d/%d%n",
-                                entry.getKey(),
-                                stats.diskUtil(),
-                                stats.cpuUtil(),
-                                stats.leaderBytesInRate(),
-                                stats.followerBytesInRate(),
-                                stats.bytesOutRate(),
-                                stats.potentialBytesOutRate(),
-                                stats.numLeaders(),
-                                stats.numReplicas()));
-      }
-
-      // put broker stats.
-      sb.append(String.format("%n%n%" + _hostFieldLength + "s%15s%20s%15s%25s%25s%20s%20s%20s%n",
-                              "HOST", "BROKER", "DISK(MB)", "CPU(%)", "LEADER_NW_IN(KB/s)",
-                              "FOLLOWER_NW_IN(KB/s)", "NW_OUT(KB/s)", "PNW_OUT(KB/s)", "LEADERS/REPLICAS"));
-      for (SingleBrokerStats stats : _brokerStats) {
-        sb.append(String.format("%" + _hostFieldLength + "s,%14d,%19.3f,%14.3f,%24.3f,%24.3f,%19.3f,%19.3f,%14d/%d%n",
-                                stats.host(),
-                                stats.id(),
-                                stats.basicStats().diskUtil(),
-                                stats.basicStats().cpuUtil(),
-                                stats.basicStats().leaderBytesInRate(),
-                                stats.basicStats().followerBytesInRate(),
-                                stats.basicStats().bytesOutRate(),
-                                stats.basicStats().potentialBytesOutRate(),
-                                stats.basicStats().numLeaders(),
-                                stats.basicStats().numReplicas()));
-      }
-
-      return sb.toString();
-    }
-  }
-
-  public static class SingleBrokerStats {
-    private final String _host;
-    private final int _id;
-    private final Broker.State _state;
-    final BasicStats _basicStats;
-
-    private SingleBrokerStats(String host, int id, Broker.State state, double diskUtil, double cpuUtil, double leaderBytesInRate,
-                              double followerBytesInRate, double bytesOutRate, double potentialBytesOutRate,
-                              int numReplicas, int numLeaders) {
-      _host = host;
-      _id = id;
-      _state = state;
-      _basicStats = new BasicStats(diskUtil, cpuUtil, leaderBytesInRate, followerBytesInRate, bytesOutRate,
-                                   potentialBytesOutRate, numReplicas, numLeaders);
-    }
-
-    public String host() {
-      return _host;
-    }
-
-    public Broker.State state() {
-      return _state;
-    }
-
-    public int id() {
-      return _id;
-    }
-
-    private BasicStats basicStats() {
-      return _basicStats;
-    }
-
-    /*
-    * Return an object that can be further used
-    * to encode into JSON
-    */
-    public Map<String, Object> getJSONStructure() {
-      Map<String, Object> entry = _basicStats.getJSONStructure();
-      entry.put("Host", _host);
-      entry.put("Broker", _id);
-      entry.put("BrokerState", _state);
-      return entry;
-    }
-  }
-
-  private static class BasicStats {
-    private double _diskUtil;
-    private double _cpuUtil;
-    private double _leaderBytesInRate;
-    private double _followerBytesInRate;
-    private double _bytesOutRate;
-    private double _potentialBytesOutRate;
-    private int _numReplicas;
-    private int _numLeaders;
-
-    private BasicStats(double diskUtil, double cpuUtil, double leaderBytesInRate,
-                       double followerBytesInRate, double bytesOutRate, double potentialBytesOutRate,
-                       int numReplicas, int numLeaders) {
-      _diskUtil = diskUtil < 0.0 ? 0.0 : diskUtil;
-      _cpuUtil = cpuUtil < 0.0 ? 0.0 : cpuUtil;
-      _leaderBytesInRate = leaderBytesInRate < 0.0 ? 0.0 : leaderBytesInRate;
-      _followerBytesInRate = followerBytesInRate < 0.0 ? 0.0 : followerBytesInRate;
-      _bytesOutRate = bytesOutRate < 0.0 ? 0.0 : bytesOutRate;
-      _potentialBytesOutRate =  potentialBytesOutRate < 0.0 ? 0.0 : potentialBytesOutRate;
-      _numReplicas = numReplicas < 1 ? 0 : numReplicas;
-      _numLeaders =  numLeaders < 1 ? 0 : numLeaders;
-    }
-
-    double diskUtil() {
-      return _diskUtil;
-    }
-
-    double cpuUtil() {
-      return _cpuUtil;
-    }
-
-    double leaderBytesInRate() {
-      return _leaderBytesInRate;
-    }
-
-    double followerBytesInRate() {
-      return _followerBytesInRate;
-    }
-
-    double bytesOutRate() {
-      return _bytesOutRate;
-    }
-
-    double potentialBytesOutRate() {
-      return _potentialBytesOutRate;
-    }
-
-    int numReplicas() {
-      return _numReplicas;
-    }
-
-    int numLeaders() {
-      return _numLeaders;
-    }
-
-    void addBasicStats(BasicStats basicStats) {
-      _diskUtil += basicStats.diskUtil();
-      _cpuUtil += basicStats.cpuUtil();
-      _leaderBytesInRate += basicStats.leaderBytesInRate();
-      _followerBytesInRate += basicStats.followerBytesInRate();
-      _bytesOutRate += basicStats.bytesOutRate();
-      _potentialBytesOutRate  += basicStats.potentialBytesOutRate();
-      _numReplicas += basicStats.numReplicas();
-      _numLeaders += basicStats.numLeaders();
-    }
-
-    /*
-    * Return an object that can be further used
-    * to encode into JSON
-    */
-    public Map<String, Object> getJSONStructure() {
-      Map<String, Object> entry = new HashMap<>();
-      entry.put("DiskMB", diskUtil());
-      entry.put("CpuPct", cpuUtil());
-      entry.put("LeaderNwInRate", leaderBytesInRate());
-      entry.put("FollowerNwInRate", followerBytesInRate());
-      entry.put("NnwOutRate", bytesOutRate());
-      entry.put("PnwOutRate", potentialBytesOutRate());
-      entry.put("Replicas", numReplicas());
-      entry.put("Leaders", numLeaders());
-      return entry;
-    }
   }
 
   /**
@@ -1206,10 +1036,7 @@ public class ClusterModel implements Serializable {
     double[][] utilization = new double[resources.length][brokers().size()];
     int brokerIndex = 0;
     for (Broker broker : brokers()) {
-      double leaderBytesInRate = 0.0;
-      for (Replica leaderReplica : broker.leaderReplicas()) {
-        leaderBytesInRate += leaderReplica.load().expectedUtilizationFor(Resource.NW_IN);
-      }
+      double leaderBytesInRate = broker.leadershipLoadForNwResources().expectedUtilizationFor(Resource.NW_IN);
       for (RawAndDerivedResource derivedResource : resources) {
         switch (derivedResource) {
           case DISK: //fall through
@@ -1240,33 +1067,6 @@ public class ClusterModel implements Serializable {
     return utilization;
   }
 
-  /**
-   * Return a valid JSON encoded string
-   *
-   * @param version JSON version
-   */
-  public String getJSONString(int version) {
-    Gson gson = new Gson();
-    Map<String, Object> jsonStructure = getJsonStructure2();
-    jsonStructure.put("version", version);
-    return gson.toJson(jsonStructure);
-  }
-
-  /**
-   * Return an object that can be further used
-   * to encode into JSON (version2 thats used in writeTo)
-   */
-  public Map<String, Object> getJsonStructure2() {
-    Map<String, Object> clusterMap = new HashMap<>();
-    clusterMap.put("maxPartitionReplicationFactor", _maxReplicationFactor);
-    List<Map<String, Object>> racks = new ArrayList<>();
-    for (Rack rack : _racksById.values()) {
-      racks.add(rack.getJsonStructure());
-    }
-    clusterMap.put("racks", racks);
-    return clusterMap;
-  }
-
   public void writeTo(OutputStream out) throws IOException {
     String cluster = String.format("<Cluster maxPartitionReplicationFactor=\"%d\">%n", _maxReplicationFactor);
     out.write(cluster.getBytes(StandardCharsets.UTF_8));
@@ -1281,7 +1081,7 @@ public class ClusterModel implements Serializable {
     StringBuilder bldr = new StringBuilder();
     bldr.append("ClusterModel[brokerCount=").append(this.brokers().size())
         .append(",partitionCount=").append(_partitionsByTopicPartition.size())
-        .append(",healthyBrokerCount=").append(_healthyBrokers.size())
+        .append(",aliveBrokerCount=").append(_aliveBrokers.size())
         .append(']');
     return bldr.toString();
   }

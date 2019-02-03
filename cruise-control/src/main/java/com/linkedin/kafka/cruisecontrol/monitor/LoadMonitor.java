@@ -14,11 +14,11 @@ import com.linkedin.cruisecontrol.monitor.sampling.aggregator.Extrapolation;
 import com.linkedin.cruisecontrol.monitor.sampling.aggregator.MetricSampleCompleteness;
 import com.linkedin.cruisecontrol.monitor.sampling.aggregator.MetricValues;
 import com.linkedin.cruisecontrol.monitor.sampling.aggregator.ValuesAndExtrapolations;
-import com.linkedin.kafka.cruisecontrol.common.Resource;
 import com.linkedin.kafka.cruisecontrol.analyzer.AnalyzerUtils;
 import com.linkedin.kafka.cruisecontrol.common.KafkaCruiseControlThreadFactory;
 import com.linkedin.kafka.cruisecontrol.common.MetadataClient;
 import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityConfigResolver;
+import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityInfo;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.async.progress.GeneratingClusterModel;
 import com.linkedin.kafka.cruisecontrol.async.progress.OperationProgress;
@@ -34,6 +34,7 @@ import com.linkedin.cruisecontrol.monitor.sampling.aggregator.MetricSampleAggreg
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.PartitionMetricSample;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.aggregator.SampleExtrapolation;
 import com.linkedin.kafka.cruisecontrol.monitor.task.LoadMonitorTaskRunner;
+import com.linkedin.kafka.cruisecontrol.servlet.response.stats.BrokerStats;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -91,7 +92,7 @@ public class LoadMonitor {
   private volatile long _lastUpdate;
 
   private volatile ModelGeneration _cachedBrokerLoadGeneration;
-  private volatile ClusterModel.BrokerStats _cachedBrokerLoadStats;
+  private volatile BrokerStats _cachedBrokerLoadStats;
 
   /**
    * Construct a load monitor.
@@ -145,26 +146,26 @@ public class LoadMonitor {
     _clusterModelSemaphore = new Semaphore(Math.max(1, numPrecomputingThread), true);
 
     _defaultModelCompletenessRequirements =
-        MonitorUtils.combineLoadRequirementOptions(AnalyzerUtils.getGoalMapByPriority(config).values());
+        MonitorUtils.combineLoadRequirementOptions(AnalyzerUtils.getGoalMapByPriority(config));
 
     _loadMonitorTaskRunner =
         new LoadMonitorTaskRunner(config, _partitionMetricSampleAggregator, _brokerMetricSampleAggregator,
                                   _metadataClient, metricDef, time, dropwizardMetricRegistry);
     _clusterModelCreationTimer = dropwizardMetricRegistry.timer(MetricRegistry.name("LoadMonitor",
-                                                                                     "cluster-model-creation-timer"));
+                                                                                    "cluster-model-creation-timer"));
     _loadMonitorExecutor = Executors.newScheduledThreadPool(2,
-        new KafkaCruiseControlThreadFactory("LoadMonitorExecutor", true, LOG));
+                                                            new KafkaCruiseControlThreadFactory("LoadMonitorExecutor", true, LOG));
     _loadMonitorExecutor.scheduleAtFixedRate(new SensorUpdater(), 0, SensorUpdater.UPDATE_INTERVAL_MS, TimeUnit.MILLISECONDS);
     _loadMonitorExecutor.scheduleAtFixedRate(new PartitionMetricSampleAggregatorCleaner(), 0,
                                              PartitionMetricSampleAggregatorCleaner.CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS);
     dropwizardMetricRegistry.register(MetricRegistry.name("LoadMonitor", "valid-windows"),
-                                       (Gauge<Integer>) this::numValidSnapshotWindows);
+                                      (Gauge<Integer>) this::numValidSnapshotWindows);
     dropwizardMetricRegistry.register(MetricRegistry.name("LoadMonitor", "monitored-partitions-percentage"),
-                                       (Gauge<Double>) this::monitoredPartitionsPercentage);
+                                      (Gauge<Double>) this::monitoredPartitionsPercentage);
     dropwizardMetricRegistry.register(MetricRegistry.name("LoadMonitor", "total-monitored-windows"),
-                                       (Gauge<Integer>) this::totalMonitoredSnapshotWindows);
+                                      (Gauge<Integer>) this::totalMonitoredSnapshotWindows);
     dropwizardMetricRegistry.register(MetricRegistry.name("LoadMonitor", "num-partitions-with-extrapolations"),
-                                       (Gauge<Integer>) this::numPartitionsWithExtrapolations);
+                                      (Gauge<Integer>) this::numPartitionsWithExtrapolations);
   }
 
 
@@ -232,7 +233,8 @@ public class LoadMonitor {
                                         validPartitionRatio,
                                         numValidPartitions,
                                         totalNumPartitions,
-                                        extrapolations);
+                                        extrapolations,
+                                        _loadMonitorTaskRunner.reasonOfLatestPauseOrResume());
       case SAMPLING:
         return LoadMonitorState.sampling(numValidSnapshotWindows,
                                          validPartitionRatio,
@@ -244,7 +246,8 @@ public class LoadMonitor {
                                        validPartitionRatio,
                                        numValidPartitions,
                                        totalNumPartitions,
-                                       extrapolations);
+                                       extrapolations,
+                                       _loadMonitorTaskRunner.reasonOfLatestPauseOrResume());
       case BOOTSTRAPPING:
         double bootstrapProgress = _loadMonitorTaskRunner.bootStrapProgress();
         // Handle the race between querying the state and getting the progress.
@@ -327,16 +330,20 @@ public class LoadMonitor {
   /**
    * Pause all the activities of the load monitor. The load monitor can only be paused when it is in
    * RUNNING state.
+   *
+   * @param reason The reason for pausing metric sampling.
    */
-  public void pauseMetricSampling() {
-    _loadMonitorTaskRunner.pauseSampling();
+  public void pauseMetricSampling(String reason) {
+    _loadMonitorTaskRunner.pauseSampling(reason);
   }
 
   /**
    * Resume the activities of the load monitor.
+   *
+   * @param reason The reason for resuming metric sampling.
    */
-  public void resumeMetricSampling() {
-    _loadMonitorTaskRunner.resumeSampling();
+  public void resumeMetricSampling(String reason) {
+    _loadMonitorTaskRunner.resumeSampling(reason);
   }
 
   /**
@@ -383,11 +390,13 @@ public class LoadMonitor {
    * @param operationProgress the progress to report.
    * @return A cluster model with the configured number of windows whose timestamp is before given timestamp.
    */
-  public ClusterModel clusterModel(long now, ModelCompletenessRequirements requirements, OperationProgress operationProgress)
+  public ClusterModel clusterModel(long now,
+                                   ModelCompletenessRequirements requirements,
+                                   OperationProgress operationProgress)
       throws NotEnoughValidWindowsException {
     ClusterModel clusterModel = clusterModel(-1L, now, requirements, operationProgress);
     // Micro optimization: put the broker stats construction out of the lock.
-    ClusterModel.BrokerStats brokerStats = clusterModel.brokerStats();
+    BrokerStats brokerStats = clusterModel.brokerStats();
     // update the cached brokerLoadStats
     synchronized (this) {
       _cachedBrokerLoadStats = brokerStats;
@@ -447,7 +456,7 @@ public class LoadMonitor {
         // If the rack is not specified, we use the host info as rack info.
         String rack = getRackHandleNull(node);
         clusterModel.createRack(rack);
-        Map<Resource, Double> brokerCapacity =
+        BrokerCapacityInfo brokerCapacity =
             _brokerCapacityConfigResolver.capacityForBroker(rack, node.host(), node.id());
         clusterModel.createBroker(rack, node.host(), node.id(), brokerCapacity);
       }
@@ -461,7 +470,9 @@ public class LoadMonitor {
 
       // Get the dead brokers and mark them as dead.
       deadBrokers(kafkaCluster).forEach(brokerId -> clusterModel.setBrokerState(brokerId, Broker.State.DEAD));
-      LOG.debug("Generated cluster model in {} ms", System.currentTimeMillis() - start);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Generated cluster model in {} ms", System.currentTimeMillis() - start);
+      }
     } finally {
       ctx.stop();
     }
@@ -479,16 +490,14 @@ public class LoadMonitor {
 
   /**
    * Get the cached load.
-   * @return the cached load, null if the load
+   * @return The cached load, or null if (1) load or metadata is stale or (2) cached load violates capacity requirements.
    */
-  public ClusterModel.BrokerStats cachedBrokerLoadStats() {
-    int clusterGeneration = _metadataClient.refreshMetadata().generation();
-    synchronized (this) {
-      if (_cachedBrokerLoadGeneration != null
-          && clusterGeneration == _cachedBrokerLoadGeneration.clusterGeneration()
-          && _partitionMetricSampleAggregator.generation() == _cachedBrokerLoadGeneration.loadGeneration()) {
-        return _cachedBrokerLoadStats;
-      }
+  public synchronized BrokerStats cachedBrokerLoadStats(boolean allowCapacityEstimation) {
+    if (_cachedBrokerLoadGeneration != null
+        && (allowCapacityEstimation || !_cachedBrokerLoadStats.isBrokerStatsEstimated())
+        && _partitionMetricSampleAggregator.generation() == _cachedBrokerLoadGeneration.loadGeneration()
+        && _metadataClient.refreshMetadata().generation() == _cachedBrokerLoadGeneration.clusterGeneration()) {
+      return _cachedBrokerLoadStats;
     }
     return null;
   }
@@ -533,8 +542,9 @@ public class LoadMonitor {
    * @return all the available broker level metrics. Null is returned if nothing is available.
    */
   public MetricSampleAggregationResult<String, BrokerEntity> brokerMetrics() {
-    Set<BrokerEntity> brokerEntities = new HashSet<>();
-    for (Node node : _metadataClient.cluster().nodes()) {
+    List<Node> nodes = _metadataClient.cluster().nodes();
+    Set<BrokerEntity> brokerEntities = new HashSet<>(nodes.size());
+    for (Node node : nodes) {
       brokerEntities.add(new BrokerEntity(node.host(), node.id()));
     }
     return _brokerMetricSampleAggregator.aggregate(brokerEntities);
@@ -559,7 +569,7 @@ public class LoadMonitor {
         String rack = getRackHandleNull(replica);
         // Note that we assume the capacity resolver can still return the broker capacity even if the broker
         // is dead. We need this to get the host resource capacity.
-        Map<Resource, Double> brokerCapacity =
+        BrokerCapacityInfo brokerCapacity =
             _brokerCapacityConfigResolver.capacityForBroker(rack, replica.host(), replica.id());
         clusterModel.handleDeadBroker(rack, replica.id(), brokerCapacity);
         boolean isLeader;
@@ -762,7 +772,7 @@ public class LoadMonitor {
   public class AutoCloseableSemaphore implements AutoCloseable {
     private AtomicBoolean _closed = new AtomicBoolean(false);
     @Override
-    public void close() throws Exception {
+    public void close() {
       if (_closed.compareAndSet(false, true)) {
         _clusterModelSemaphore.release();
         _acquiredClusterModelSemaphore.set(false);

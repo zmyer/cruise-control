@@ -5,6 +5,7 @@
 
 package com.linkedin.kafka.cruisecontrol.analyzer.goals;
 
+import com.linkedin.kafka.cruisecontrol.analyzer.OptimizationOptions;
 import com.linkedin.kafka.cruisecontrol.common.Resource;
 import com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance;
 import com.linkedin.kafka.cruisecontrol.analyzer.AnalyzerUtils;
@@ -18,6 +19,7 @@ import com.linkedin.kafka.cruisecontrol.model.ClusterModelStats;
 import com.linkedin.kafka.cruisecontrol.model.Load;
 import com.linkedin.kafka.cruisecontrol.model.Replica;
 
+import com.linkedin.kafka.cruisecontrol.model.ReplicaSortFunctionFactory;
 import com.linkedin.kafka.cruisecontrol.monitor.ModelCompletenessRequirements;
 import java.util.List;
 import java.util.Set;
@@ -37,6 +39,7 @@ import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.REPLICA
  */
 public abstract class CapacityGoal extends AbstractGoal {
   private static final Logger LOG = LoggerFactory.getLogger(CapacityGoal.class);
+  private static final int MIN_NUM_VALID_WINDOWS = 1;
 
   /**
    * Constructor for Capacity Goal.
@@ -53,15 +56,6 @@ public abstract class CapacityGoal extends AbstractGoal {
   }
 
   protected abstract Resource resource();
-
-  /**
-   * @deprecated
-   * Please use {@link #actionAcceptance(BalancingAction, ClusterModel)} instead.
-   */
-  @Override
-  public boolean isActionAcceptable(BalancingAction action, ClusterModel clusterModel) {
-    return actionAcceptance(action, clusterModel) == ACCEPT;
-  }
 
   /**
    * Check whether the given action is acceptable by this goal. An action is acceptable by a goal if it satisfies
@@ -110,7 +104,7 @@ public abstract class CapacityGoal extends AbstractGoal {
   @Override
   public ModelCompletenessRequirements clusterModelCompletenessRequirements() {
     // We only need the latest snapshot and include all the topics.
-    return new ModelCompletenessRequirements(1, _minMonitoredPartitionPercentage, true);
+    return new ModelCompletenessRequirements(MIN_NUM_VALID_WINDOWS, _minMonitoredPartitionPercentage, true);
   }
 
   /**
@@ -154,7 +148,7 @@ public abstract class CapacityGoal extends AbstractGoal {
 
   /**
    * Sanity checks: Existing total load on cluster is less than the limiting capacity
-   * determined by the total capacity of healthy cluster multiplied by the capacity threshold.
+   * determined by the total capacity of alive cluster multiplied by the capacity threshold.
    *
    * @param clusterModel The state of the cluster.
    * @param excludedTopics The topics that should be excluded from the optimization proposals.
@@ -172,6 +166,13 @@ public abstract class CapacityGoal extends AbstractGoal {
       throw new OptimizationFailureException("Insufficient healthy cluster capacity for resource:" + resource() +
           " existing cluster utilization " + existingUtilization + " allowed capacity " + allowedCapacity);
     }
+    clusterModel.trackSortedReplicas(sortName(),
+                                     ReplicaSortFunctionFactory.deprioritizeImmigrants(),
+                                     ReplicaSortFunctionFactory.sortByMetricGroupValue(resource().name()));
+    clusterModel.trackSortedReplicas(sortNameByLeader(),
+                                     ReplicaSortFunctionFactory.selectLeaders(),
+                                     ReplicaSortFunctionFactory.deprioritizeImmigrants(),
+                                     ReplicaSortFunctionFactory.sortByMetricGroupValue(resource().name()));
   }
 
   /**
@@ -190,11 +191,13 @@ public abstract class CapacityGoal extends AbstractGoal {
     // Sanity check: No self-healing eligible replica should remain at a decommissioned broker.
     AnalyzerUtils.ensureNoReplicaOnDeadBrokers(clusterModel);
     finish();
+    clusterModel.untrackSortedReplicas(sortName());
+    clusterModel.untrackSortedReplicas(sortNameByLeader());
   }
 
   /**
    * Ensure that for the resource, the utilization is under the capacity of the host/broker-level.
-   * {@link Resource#_isBrokerResource} and {@link Resource#isHostResource()} determines the level of checks this
+   * {@link Resource#isBrokerResource()} and {@link Resource#isHostResource()} determines the level of checks this
    * function performs.
    * @param clusterModel Cluster model.
    */
@@ -244,13 +247,13 @@ public abstract class CapacityGoal extends AbstractGoal {
    * @param broker         Broker to be balanced.
    * @param clusterModel   The state of the cluster.
    * @param optimizedGoals Optimized goals.
-   * @param excludedTopics The topics that should be excluded from the optimization action.
+   * @param optimizationOptions Options to take into account during optimization -- e.g. excluded topics.
    */
   @Override
   protected void rebalanceForBroker(Broker broker,
                                     ClusterModel clusterModel,
                                     Set<Goal> optimizedGoals,
-                                    Set<String> excludedTopics)
+                                    OptimizationOptions optimizationOptions)
       throws OptimizationFailureException {
     LOG.debug("balancing broker {}, optimized goals = {}", broker, optimizedGoals);
     Resource currentResource = resource();
@@ -265,11 +268,13 @@ public abstract class CapacityGoal extends AbstractGoal {
       return;
     }
 
+    Set<String> excludedTopics = optimizationOptions.excludedTopics();
     // First try REBALANCE BY LEADERSHIP MOVEMENT:
     if (currentResource == Resource.NW_OUT || currentResource == Resource.CPU) {
       // Sort replicas by descending order of preference to relocate. Preference is based on resource cost.
       // Only leaders in the source broker are sorted.
-      List<Replica> sortedLeadersInSourceBroker = broker.sortedLeadersFor(currentResource);
+      List<Replica> sortedLeadersInSourceBroker =
+          broker.trackedSortedReplicas(sortNameByLeader()).reverselySortedReplicas();
       for (Replica leader : sortedLeadersInSourceBroker) {
         if (shouldExclude(leader, excludedTopics)) {
           continue;
@@ -280,7 +285,7 @@ public abstract class CapacityGoal extends AbstractGoal {
         List<Broker> eligibleBrokers = followers.stream().map(Replica::broker).collect(Collectors.toList());
 
         Broker b = maybeApplyBalancingAction(clusterModel, leader, eligibleBrokers,
-                                             ActionType.LEADERSHIP_MOVEMENT, optimizedGoals);
+                                             ActionType.LEADERSHIP_MOVEMENT, optimizedGoals, optimizationOptions);
         if (b == null) {
           LOG.debug("Failed to move leader replica {} to any other brokers in {}", leader, eligibleBrokers);
         }
@@ -295,23 +300,23 @@ public abstract class CapacityGoal extends AbstractGoal {
 
     // If leader movement did not work, move replicas.
     if (isUtilizationOverLimit) {
-      // Get sorted healthy brokers under host and/or broker capacity limit (depending on the current resource).
-      List<Broker> sortedHealthyBrokersUnderCapacityLimit =
-          clusterModel.sortedHealthyBrokersUnderThreshold(currentResource, capacityThreshold);
+      // Get sorted alive brokers under host and/or broker capacity limit (depending on the current resource).
+      List<Broker> sortedAliveBrokersUnderCapacityLimit =
+          clusterModel.sortedAliveBrokersUnderThreshold(currentResource, capacityThreshold);
 
       // Move replicas that are sorted in descending order of preference to relocate (preference is based on
       // utilization) until the source broker utilization gets under the capacity limit. If the capacity limit cannot
       // be satisfied, throw an exception.
-      for (Replica replica : broker.sortedReplicas(currentResource)) {
+      for (Replica replica : broker.trackedSortedReplicas(sortName()).reverselySortedReplicas()) {
         if (shouldExclude(replica, excludedTopics)) {
           continue;
         }
         // Unless the target broker would go over the host- and/or broker-level capacity,
         // the movement will be successful.
-        Broker b = maybeApplyBalancingAction(clusterModel, replica, sortedHealthyBrokersUnderCapacityLimit,
-                                             ActionType.REPLICA_MOVEMENT, optimizedGoals);
+        Broker b = maybeApplyBalancingAction(clusterModel, replica, sortedAliveBrokersUnderCapacityLimit,
+                                             ActionType.REPLICA_MOVEMENT, optimizedGoals, optimizationOptions);
         if (b == null) {
-          LOG.debug("Failed to move replica {} to any broker in {}", replica, sortedHealthyBrokersUnderCapacityLimit);
+          LOG.debug("Failed to move replica {} to any broker in {}", replica, sortedAliveBrokersUnderCapacityLimit);
         }
         // If capacity limit was not satisfied before, check if it is satisfied now.
         isUtilizationOverLimit =
@@ -335,6 +340,14 @@ public abstract class CapacityGoal extends AbstractGoal {
             + broker.host().name() + " for resource " + currentResource);
       }
     }
+  }
+
+  private String sortName() {
+    return name() + "-" + resource().name() + "-ALL";
+  }
+
+  private String sortNameByLeader() {
+    return name() + "-" + resource().name() + "-LEADER";
   }
 
   /**
@@ -380,7 +393,7 @@ public abstract class CapacityGoal extends AbstractGoal {
    */
   private boolean isMovementAcceptableForCapacity(Replica sourceReplica, Broker destinationBroker) {
     // The action is unacceptable if the movement of replica or leadership makes the utilization of the destination
-    // broker (or destination host for a host-resource) go out of healthy capacity for the given resource.
+    // broker (or destination host for a host-resource) go out of alive capacity for the given resource.
     double replicaUtilization = sourceReplica.load().expectedUtilizationFor(resource());
     return isUtilizationUnderLimitAfterAddingLoad(destinationBroker, replicaUtilization);
   }

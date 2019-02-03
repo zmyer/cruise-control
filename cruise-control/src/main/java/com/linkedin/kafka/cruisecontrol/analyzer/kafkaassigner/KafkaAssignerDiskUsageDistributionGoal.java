@@ -4,8 +4,8 @@
 
 package com.linkedin.kafka.cruisecontrol.analyzer.kafkaassigner;
 
+import com.linkedin.kafka.cruisecontrol.analyzer.OptimizationOptions;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.internals.BrokerAndSortedReplicas;
-import com.linkedin.kafka.cruisecontrol.common.Resource;
 import com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance;
 import com.linkedin.kafka.cruisecontrol.analyzer.BalancingConstraint;
 import com.linkedin.kafka.cruisecontrol.analyzer.BalancingAction;
@@ -85,7 +85,8 @@ public class KafkaAssignerDiskUsageDistributionGoal implements Goal {
   }
 
   @Override
-  public boolean optimize(ClusterModel clusterModel, Set<Goal> optimizedGoals, Set<String> excludedTopics) {
+  public boolean optimize(ClusterModel clusterModel, Set<Goal> optimizedGoals, OptimizationOptions optimizationOptions) {
+    Set<String> excludedTopics = optimizationOptions.excludedTopics();
     double meanDiskUsage = clusterModel.load().expectedUtilizationFor(DISK) / clusterModel.capacityFor(DISK);
     double upperThreshold = meanDiskUsage * (1 + balancePercentageWithMargin());
     double lowerThreshold = meanDiskUsage * Math.max(0, (1 - balancePercentageWithMargin()));
@@ -99,7 +100,7 @@ public class KafkaAssignerDiskUsageDistributionGoal implements Goal {
 
     // create a sorted set for all the brokers.
     SortedSet<BrokerAndSortedReplicas> allBrokers = new TreeSet<>(brokerComparator);
-    clusterModel.healthyBrokers().forEach(b -> allBrokers.add(new BrokerAndSortedReplicas(b, replicaComparator)));
+    clusterModel.aliveBrokers().forEach(b -> allBrokers.add(new BrokerAndSortedReplicas(b, replicaComparator)));
 
     boolean improved;
     int numIterations = 0;
@@ -122,6 +123,15 @@ public class KafkaAssignerDiskUsageDistributionGoal implements Goal {
   }
 
   /**
+   * @deprecated
+   * Please use {@link #optimize(ClusterModel, Set, OptimizationOptions)} instead.
+   */
+  @Override
+  public boolean optimize(ClusterModel clusterModel, Set<Goal> optimizedGoals, Set<String> excludedTopics) {
+    return optimize(clusterModel, optimizedGoals, new OptimizationOptions(excludedTopics));
+  }
+
+  /**
    * Check whether the cluster model still has brokers whose disk usage are above upper threshold or below lower
    * threshold.
    *
@@ -135,7 +145,7 @@ public class KafkaAssignerDiskUsageDistributionGoal implements Goal {
     // Check if any broker is out of the allowed usage range.
     Set<Broker> brokersAboveUpperThreshold = new HashSet<>();
     Set<Broker> brokersUnderLowerThreshold = new HashSet<>();
-    for (Broker broker : clusterModel.healthyBrokers()) {
+    for (Broker broker : clusterModel.aliveBrokers()) {
       double diskUsage = diskUsage(broker);
       if (diskUsage < lowerThreshold) {
         brokersUnderLowerThreshold.add(broker);
@@ -161,7 +171,7 @@ public class KafkaAssignerDiskUsageDistributionGoal implements Goal {
   /**
    * Optimize the broker if the disk usage of the broker is not within the required range.
    *
-   * @param allBrokers a sorted set of all the healthy brokers in the cluster.
+   * @param allBrokers a sorted set of all the alive brokers in the cluster.
    * @param toOptimize the broker to optimize
    * @param clusterModel the cluster model
    * @param meanDiskUsage the average disk usage of the cluster
@@ -179,22 +189,28 @@ public class KafkaAssignerDiskUsageDistributionGoal implements Goal {
                                    double lowerThreshold,
                                    double upperThreshold,
                                    Set<String> excludedTopics) {
-    LOG.trace("Optimizing broker {}. BrokerDiskUsage = {}, meanDiskUsage = {}",
-              toOptimize.broker(), dWrap(diskUsage(toOptimize.broker())), dWrap(meanDiskUsage));
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Optimizing broker {}. BrokerDiskUsage = {}, meanDiskUsage = {}",
+                toOptimize.broker(), dWrap(diskUsage(toOptimize.broker())), dWrap(meanDiskUsage));
+    }
     double brokerDiskUsage = diskUsage(toOptimize.broker());
     boolean improved = false;
     List<BrokerAndSortedReplicas> candidateBrokersToSwapWith;
 
     if (brokerDiskUsage > upperThreshold) {
-      LOG.debug("Broker {} disk usage {} is above upper threshold of {}",
-                toOptimize.broker().id(), dWrap(brokerDiskUsage), dWrap(upperThreshold));
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Broker {} disk usage {} is above upper threshold of {}",
+                  toOptimize.broker().id(), dWrap(brokerDiskUsage), dWrap(upperThreshold));
+      }
       // Get the brokers whose disk usage is less than the broker to optimize. The list is in ascending order based on
       // broker disk usage.
       candidateBrokersToSwapWith = new ArrayList<>(allBrokers.headSet(toOptimize));
 
     } else if (brokerDiskUsage < lowerThreshold) {
-      LOG.debug("Broker {} disk usage {} is below lower threshold of {}",
-                toOptimize.broker().id(), dWrap(brokerDiskUsage), dWrap(lowerThreshold));
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Broker {} disk usage {} is below lower threshold of {}",
+                  toOptimize.broker().id(), dWrap(brokerDiskUsage), dWrap(lowerThreshold));
+      }
       // Get the brokers whose disk usage is more than the broker to optimize. The list is in descending order based on
       // broker disk usage.
       candidateBrokersToSwapWith = new ArrayList<>(allBrokers.tailSet(toOptimize));
@@ -242,8 +258,10 @@ public class KafkaAssignerDiskUsageDistributionGoal implements Goal {
                        double meanDiskUsage,
                        ClusterModel clusterModel,
                        Set<String> excludedTopics) {
-    LOG.trace("Swapping replicas between broker {}({}) and broker {}({})",
-             toSwap.broker().id(), dWrap(brokerSize(toSwap)), toSwapWith.broker().id(), dWrap(brokerSize(toSwapWith)));
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Swapping replicas between broker {}({}) and broker {}({})",
+                toSwap.broker().id(), dWrap(brokerSize(toSwap)), toSwapWith.broker().id(), dWrap(brokerSize(toSwapWith)));
+    }
     double sizeToChange = toSwap.broker().capacityFor(DISK) * meanDiskUsage - brokerSize(toSwap);
     NavigableSet<ReplicaWrapper> sortedReplicasToSwap = sortReplicasAscend(toSwap, excludedTopics);
     NavigableSet<ReplicaWrapper> sortedLeadersToSwapWith = sortReplicasAscend(toSwapWith, excludedTopics);
@@ -326,15 +344,19 @@ public class KafkaAssignerDiskUsageDistributionGoal implements Goal {
       double targetSize = sizeToSwap + sizeToChange;
 
       // Find a replica that is eligible for swap.
-      LOG.trace("replicaToSwap: {}(size={}), targetSize={}, minSize={}, maxSize={}",
-                replicaToSwap, dWrap(replicaSize(replicaToSwap)), dWrap(targetSize), dWrap(minSize), dWrap(maxSize));
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("replicaToSwap: {}(size={}), targetSize={}, minSize={}, maxSize={}",
+                  replicaToSwap, dWrap(replicaSize(replicaToSwap)), dWrap(targetSize), dWrap(minSize), dWrap(maxSize));
+      }
       Replica replicaToSwapWith = sortedReplicasToSwapWith.isEmpty() ? null :
                                   findReplicaToSwapWith(replicaToSwap, sortedReplicasToSwapWith, targetSize, minSize, maxSize, clusterModel);
       if (replicaToSwapWith != null) {
-        LOG.debug("Found replica to swap. Swapping {}({}) on broker {}({}) and {}({}) on broker {}({})",
-                  replicaToSwap.topicPartition(), dWrap(replicaSize(replicaToSwap)), toSwap.broker().id(),
-                  dWrap(brokerSize(toSwap)), replicaToSwapWith.topicPartition(), dWrap(replicaSize(replicaToSwapWith)),
-                  toSwapWith.broker().id(), dWrap(brokerSize(toSwapWith)));
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Found replica to swap. Swapping {}({}) on broker {}({}) and {}({}) on broker {}({})",
+                    replicaToSwap.topicPartition(), dWrap(replicaSize(replicaToSwap)), toSwap.broker().id(),
+                    dWrap(brokerSize(toSwap)), replicaToSwapWith.topicPartition(), dWrap(replicaSize(replicaToSwapWith)),
+                    toSwapWith.broker().id(), dWrap(brokerSize(toSwapWith)));
+        }
         clusterModel.relocateReplica(replicaToSwapWith.topicPartition(), toSwapWith.broker().id(), toSwap.broker().id());
         clusterModel.relocateReplica(replicaToSwap.topicPartition(), toSwap.broker().id(), toSwapWith.broker().id());
         toSwap.sortedReplicas().remove(replicaToSwap);
@@ -472,9 +494,6 @@ public class KafkaAssignerDiskUsageDistributionGoal implements Goal {
     return (inSameRack || rackAware) && sameRole;
   }
 
-  /**
-   * We cannot use {@link Broker#sortedReplicas(Resource)} because the that prioritize the immigrant replicas.
-   */
   private NavigableSet<ReplicaWrapper> sortReplicasAscend(BrokerAndSortedReplicas bas, Set<String> excludedTopics) {
     NavigableSet<ReplicaWrapper> sortedReplicas = new TreeSet<>();
     bas.sortedReplicas().forEach(r -> {
@@ -493,11 +512,6 @@ public class KafkaAssignerDiskUsageDistributionGoal implements Goal {
       }
     });
     return sortedFollowers;
-  }
-
-  @Override
-  public boolean isActionAcceptable(BalancingAction action, ClusterModel clusterModel) {
-    throw new IllegalStateException("No goal should be executed after " + name());
   }
 
   @Override
@@ -650,7 +664,7 @@ public class KafkaAssignerDiskUsageDistributionGoal implements Goal {
 
   // Thin wrapper around double for printing purpose.
   private static class DoubleWrapper {
-    double _value;
+    final double _value;
 
     private DoubleWrapper(double value) {
       _value = value;

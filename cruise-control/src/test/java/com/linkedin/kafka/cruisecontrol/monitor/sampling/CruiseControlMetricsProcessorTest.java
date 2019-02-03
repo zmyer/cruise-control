@@ -4,6 +4,7 @@
 
 package com.linkedin.kafka.cruisecontrol.monitor.sampling;
 
+import com.linkedin.kafka.cruisecontrol.metricsreporter.exception.UnknownVersionException;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.BrokerMetric;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.CruiseControlMetric;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.RawMetricType;
@@ -23,6 +24,8 @@ import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
 import org.junit.Test;
 
+import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC1;
+import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC2;
 import static com.linkedin.kafka.cruisecontrol.metricsreporter.metric.RawMetricType.*;
 import static com.linkedin.kafka.cruisecontrol.monitor.metricdefinition.KafkaMetricDef.*;
 import static org.junit.Assert.assertEquals;
@@ -36,8 +39,6 @@ import static org.junit.Assert.fail;
 public class CruiseControlMetricsProcessorTest {
   private static final int BYTES_IN_KB = 1024;
   private static final int BYTES_IN_MB = 1024 * 1024;
-  private static final String TOPIC1 = "topic1";
-  private static final String TOPIC2 = "topic2";
   private static final int P0 = 0;
   private static final int P1 = 1;
   private static final TopicPartition T1P0 = new TopicPartition(TOPIC1, P0);
@@ -50,7 +51,7 @@ public class CruiseControlMetricsProcessorTest {
   private final Time _time = new MockTime(0, 100L, TimeUnit.NANOSECONDS.convert(100L, TimeUnit.MILLISECONDS));
 
   @Test
-  public void testBasic() {
+  public void testBasic() throws UnknownVersionException {
     CruiseControlMetricsProcessor processor = new CruiseControlMetricsProcessor();
     Set<CruiseControlMetric> metrics = getCruiseControlMetrics();
     metrics.forEach(processor::addMetric);
@@ -89,7 +90,7 @@ public class CruiseControlMetricsProcessorTest {
   }
 
   @Test
-  public void testMissingBrokerCpuUtilization() {
+  public void testMissingBrokerCpuUtilization() throws UnknownVersionException {
     CruiseControlMetricsProcessor processor = new CruiseControlMetricsProcessor();
     Set<CruiseControlMetric> metrics = getCruiseControlMetrics();
     for (CruiseControlMetric metric : metrics) {
@@ -106,7 +107,7 @@ public class CruiseControlMetricsProcessorTest {
   }
 
   @Test
-  public void testMissingOtherBrokerMetrics() {
+  public void testMissingOtherBrokerMetrics() throws UnknownVersionException {
     CruiseControlMetricsProcessor processor = new CruiseControlMetricsProcessor();
     Set<CruiseControlMetric> metrics = getCruiseControlMetrics();
     for (CruiseControlMetric metric : metrics) {
@@ -123,7 +124,7 @@ public class CruiseControlMetricsProcessorTest {
   }
 
   @Test
-  public void testMissingPartitionSizeMetric() {
+  public void testMissingPartitionSizeMetric() throws UnknownVersionException {
     CruiseControlMetricsProcessor processor = new CruiseControlMetricsProcessor();
     Set<CruiseControlMetric> metrics = getCruiseControlMetrics();
     for (CruiseControlMetric metric : metrics) {
@@ -145,7 +146,7 @@ public class CruiseControlMetricsProcessorTest {
   }
 
   @Test
-  public void testMissingTopicBytesInMetric() {
+  public void testMissingTopicBytesInMetric() throws UnknownVersionException {
     CruiseControlMetricsProcessor processor = new CruiseControlMetricsProcessor();
     Set<CruiseControlMetric> metrics = getCruiseControlMetrics();
     Set<RawMetricType> metricTypeToExclude = new HashSet<>(Arrays.asList(TOPIC_BYTES_IN,
@@ -188,7 +189,7 @@ public class CruiseControlMetricsProcessorTest {
     Set<CruiseControlMetric> metrics = new HashSet<>();
 
     int i = 0;
-    for (RawMetricType rawMetricType : RawMetricType.brokerMetricTypes()) {
+    for (RawMetricType rawMetricType : RawMetricType.brokerMetricTypesDiffForVersion(BrokerMetricSample.MIN_SUPPORTED_VERSION)) {
       switch (rawMetricType) {
         case ALL_TOPIC_BYTES_IN:
           metrics.add(new BrokerMetric(RawMetricType.ALL_TOPIC_BYTES_IN, _time.milliseconds(), BROKER_ID_0, 820.0 * BYTES_IN_KB));

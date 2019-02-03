@@ -4,9 +4,9 @@
 
 package com.linkedin.kafka.cruisecontrol.analyzer.goals;
 
+import com.linkedin.kafka.cruisecontrol.analyzer.OptimizationOptions;
 import com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance;
 import com.linkedin.kafka.cruisecontrol.analyzer.BalancingAction;
-import com.linkedin.kafka.cruisecontrol.exception.KafkaCruiseControlException;
 import com.linkedin.kafka.cruisecontrol.model.Broker;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModelStats;
@@ -17,10 +17,12 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUtils.isPartitionUnderReplicated;
 import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.ACCEPT;
 
 
@@ -29,20 +31,49 @@ import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.ACCEPT;
  */
 public class PreferredLeaderElectionGoal implements Goal {
   private static final Logger LOG = LoggerFactory.getLogger(PreferredLeaderElectionGoal.class);
+  private final boolean _skipUrpDemotion;
+  private final boolean _excludeFollowerDemotion;
+  private final Cluster _kafkaCluster;
+
+  public PreferredLeaderElectionGoal() {
+    this(false, false, null);
+  }
+
+  public PreferredLeaderElectionGoal(boolean skipUrpDemotion,
+                                     boolean excludeFollowerDemotion,
+                                     Cluster kafkaCluster) {
+    if (skipUrpDemotion && kafkaCluster == null) {
+      throw new IllegalArgumentException("Cluster information is not provided.");
+    }
+    _skipUrpDemotion = skipUrpDemotion;
+    _excludeFollowerDemotion = excludeFollowerDemotion;
+    _kafkaCluster = kafkaCluster;
+  }
 
   @Override
-  public boolean optimize(ClusterModel clusterModel, Set<Goal> optimizedGoals, Set<String> excludedTopics)
-      throws KafkaCruiseControlException {
+  public boolean optimize(ClusterModel clusterModel, Set<Goal> optimizedGoals, OptimizationOptions optimizationOptions) {
     // First move the replica on the demoted brokers to the end of the replica list.
     // If all the replicas are demoted, no change is made to the leader.
     Set<TopicPartition> partitionsToMove = new HashSet<>();
     for (Broker b : clusterModel.demotedBrokers()) {
       for (Replica r : b.replicas()) {
-        Partition p = clusterModel.partition(r.topicPartition());
-        p.moveReplicaToEnd(r);
+        // There are two scenarios where replica swap operation is skipped:
+        // 1.the replica is not leader replica and _excludeFollowerDemotion is true.
+        // 2.the replica's partition is currently under replicated and _skipUrpDemotion is true.
+        if (!(_skipUrpDemotion && isPartitionUnderReplicated(_kafkaCluster, r.topicPartition()))
+            && !(_excludeFollowerDemotion && !r.isLeader())) {
+          Partition p = clusterModel.partition(r.topicPartition());
+          p.moveReplicaToEnd(r);
+        }
       }
-      b.leaderReplicas().forEach(r -> partitionsToMove.add(r.topicPartition()));
+      // If the leader replica's partition is currently under replicated and _skipUrpDemotion is true, skip leadership
+      // change operation.
+      b.leaderReplicas().stream().filter(r -> !(_skipUrpDemotion && isPartitionUnderReplicated(_kafkaCluster, r.topicPartition())))
+       .forEach(r -> partitionsToMove.add(r.topicPartition()));
     }
+    // Check whether this goal has relocated any leadership.
+    boolean relocatedLeadership = false;
+    Set<Integer> excludedBrokersForLeadership = optimizationOptions.excludedBrokersForLeadership();
     // Ignore the excluded topics because this goal does not move partitions.
     for (List<Partition> partitions : clusterModel.getPartitionsByTopic().values()) {
       for (Partition p : partitions) {
@@ -50,30 +81,39 @@ public class PreferredLeaderElectionGoal implements Goal {
           continue;
         }
         for (Replica r : p.replicas()) {
-          // Iterate over the replicas and ensure the leader is set to the first alive replica.
-          if (r.broker().isAlive()) {
+          // Iterate over the replicas and ensure that (1) the leader is set to the first alive replica, and (2) the
+          // leadership is not transferred to a broker excluded for leadership transfer.
+          Broker leaderCandidate = r.broker();
+          if (leaderCandidate.isAlive()) {
             if (!r.isLeader()) {
-              clusterModel.relocateLeadership(r.topicPartition(), p.leader().broker().id(), r.broker().id());
+              if (excludedBrokersForLeadership.contains(leaderCandidate.id())) {
+                LOG.warn("Skipped leadership transfer of partition {} to broker {} because it is among brokers excluded"
+                         + " for leadership {}.", p.topicPartition(), leaderCandidate);
+                continue;
+              }
+              clusterModel.relocateLeadership(r.topicPartition(), p.leader().broker().id(), leaderCandidate.id());
+              relocatedLeadership = true;
             }
-            if (clusterModel.demotedBrokers().contains(r.broker())) {
+            if (clusterModel.demotedBrokers().contains(leaderCandidate)) {
               LOG.warn("The leader of partition {} has to be on a demoted broker {} because all the alive "
-                           + "replicas are demoted.", p.topicPartition(), r.broker());
+                       + "replicas are demoted.", p.topicPartition(), leaderCandidate);
             }
             break;
           }
         }
       }
     }
-    return true;
+    // Return true if at least one leadership has been relocated.
+    return relocatedLeadership;
   }
 
   /**
    * @deprecated
-   * Please use {@link #actionAcceptance(BalancingAction, ClusterModel)} instead.
+   * Please use {@link #optimize(ClusterModel, Set, OptimizationOptions)} instead.
    */
   @Override
-  public boolean isActionAcceptable(BalancingAction action, ClusterModel clusterModel) {
-    return true;
+  public boolean optimize(ClusterModel clusterModel, Set<Goal> optimizedGoals, Set<String> excludedTopics) {
+    return optimize(clusterModel, optimizedGoals, new OptimizationOptions(excludedTopics));
   }
 
   @Override
@@ -91,7 +131,7 @@ public class PreferredLeaderElectionGoal implements Goal {
 
       @Override
       public String explainLastComparison() {
-        return "This goals do not care about stats.";
+        return String.format("Comparison for the %s is irrelevant.", name());
       }
     };
   }
@@ -110,5 +150,4 @@ public class PreferredLeaderElectionGoal implements Goal {
   public void configure(Map<String, ?> configs) {
 
   }
-
 }

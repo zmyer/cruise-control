@@ -30,6 +30,7 @@ import static java.lang.Math.max;
  * windows.
  */
 public class Load implements Serializable {
+  private static final String METRIC_VALUES = "MetricValues";
   // load by their time.
   private List<Long> _windows;
   private final AggregatedMetricValues _metricValues;
@@ -65,22 +66,74 @@ public class Load implements Serializable {
 
   /**
    * Get a single snapshot value that is representative for the given resource. The current algorithm uses
-   * (1) the mean of the recent resource load for inbound network load, outbound network load, and cpu load
-   * (2) the latest utilization for disk space usage.
+   * <ol>
+   *   <li>If the max load is not requested, then:
+   *   <ol>
+   *   <li>It is the mean of the recent resource load for inbound network load, outbound network load, and cpu load.</li>
+   *   <li>It is the latest utilization for disk space usage.</li>
+   *   </ol>
+   *   </li>
+   *   <li>If the max load is requested: the peak load.</li>
+   * </ol>
    *
    * @param resource Resource for which the expected utilization will be provided.
+   * @param wantMaxLoad True if the requested utilization represents the peak load, false otherwise.
    * @return A single representative utilization value on a resource.
    */
-  public double expectedUtilizationFor(Resource resource) {
+  public double expectedUtilizationFor(Resource resource, boolean wantMaxLoad) {
     if (_metricValues.isEmpty()) {
       return 0.0;
     }
     double result = 0;
     for (MetricInfo info : KafkaMetricDef.resourceToMetricInfo(resource)) {
       MetricValues valuesForId = _metricValues.valuesFor(info.id());
-      result += resource == Resource.DISK ? valuesForId.latest() : valuesForId.avg();
+      result += wantMaxLoad ? valuesForId.max() : (resource == Resource.DISK ? valuesForId.latest() : valuesForId.avg());
     }
     return max(result, 0.0);
+  }
+
+  public double expectedUtilizationFor(Resource resource) {
+    return expectedUtilizationFor(resource, _metricValues, false);
+  }
+
+  /**
+   * Get a single snapshot value that is representative for the given KafkaMetric type. The current algorithm uses
+   * <ol>
+   *   <li>If the max load is not requested, it is max/latest/mean load depending on the ValueComputingStrategy
+   *   which the KafkaMetric type uses.</li>
+   *   <li>If the max load is requested, it is the max load.</li>
+   * </ol>
+   *
+   * @param metric KafkaMetric type for which the expected utilization will be provided.
+   * @param wantMaxLoad True if the requested utilization represents the peak load, false otherwise.
+   * @return A single representative utilization value on a metric type.
+   */
+  public double expectedUtilizationFor(KafkaMetricDef metric, boolean wantMaxLoad) {
+    MetricInfo info;
+    switch (metric.defScope()) {
+      case COMMON:
+        info = KafkaMetricDef.commonMetricDef().metricInfo(metric.name());
+        break;
+      case BROKER_ONLY:
+        info = KafkaMetricDef.brokerMetricDef().metricInfo(metric.name());
+        break;
+      default:
+        throw new IllegalArgumentException("Metric scope " + metric.defScope() + " for metric " + metric.name() + " is invalid.");
+    }
+    if (_metricValues.isEmpty()) {
+      return 0.0;
+    }
+    MetricValues valuesForId = _metricValues.valuesFor(info.id());
+    if (wantMaxLoad) {
+      return max(valuesForId.max(), 0.0);
+    }
+    switch (metric.valueComputingStrategy()) {
+      case MAX: return max(valuesForId.max(), 0.0);
+      case AVG: return max(valuesForId.avg(), 0.0);
+      case LATEST: return max(valuesForId.latest(), 0.0);
+      default: throw new IllegalArgumentException("Metric value computing strategy " + metric.valueComputingStrategy() +
+                          " for metric " + metric.name() + " is invalid.");
+    }
   }
 
   /**
@@ -244,7 +297,7 @@ public class Load implements Serializable {
         metricValueList.add(metricValuesMap);
       }
     }
-    loadMap.put("MetricValues", metricValueList);
+    loadMap.put(METRIC_VALUES, metricValueList);
     return loadMap;
   }
 
@@ -264,5 +317,38 @@ public class Load implements Serializable {
   @Override
   public String toString() {
     return "<Load>" + _metricValues.toString() + "</Load>%n";
+  }
+
+  /**
+   * Get a single snapshot value that is representative for the given resource. The current algorithm uses
+   * (1) the mean of the recent resource load for inbound network load, outbound network load, and cpu load
+   * (2) the latest utilization for disk space usage.
+   *
+   * @param resource Resource for which the expected utilization will be provided.
+   * @param aggregatedMetricValues the aggregated metric values to calculate the expected utilization.
+   * @param ignoreMissingMetric whether it is allowed for the value of the given resource to be missing.
+   *                            If the value of the given resource is not found, when set to true, 0 will be returned.
+   *                            Otherwise, an exception will be thrown.
+   * @return A single representative utilization value on a resource.
+   */
+  public static double expectedUtilizationFor(Resource resource,
+                                              AggregatedMetricValues aggregatedMetricValues,
+                                              boolean ignoreMissingMetric) {
+    if (aggregatedMetricValues.isEmpty()) {
+      return 0.0;
+    }
+    double result = 0;
+    for (MetricInfo info : KafkaMetricDef.resourceToMetricInfo(resource)) {
+      MetricValues valuesForId = aggregatedMetricValues.valuesFor(info.id());
+      if (!ignoreMissingMetric && valuesForId == null) {
+        throw new IllegalArgumentException(String.format("The aggregated metric values does not contain metric "
+                                                             + "%s for resource %s.",
+                                                         info, resource.name()));
+      }
+      if (valuesForId != null) {
+        result += resource == Resource.DISK ? valuesForId.latest() : valuesForId.avg();
+      }
+    }
+    return max(result, 0.0);
   }
 }

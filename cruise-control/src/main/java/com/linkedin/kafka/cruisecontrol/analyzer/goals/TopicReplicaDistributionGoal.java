@@ -5,6 +5,7 @@
 
 package com.linkedin.kafka.cruisecontrol.analyzer.goals;
 
+import com.linkedin.kafka.cruisecontrol.analyzer.OptimizationOptions;
 import com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance;
 import com.linkedin.kafka.cruisecontrol.analyzer.AnalyzerUtils;
 import com.linkedin.kafka.cruisecontrol.analyzer.BalancingConstraint;
@@ -31,7 +32,6 @@ import org.slf4j.LoggerFactory;
 
 import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.ACCEPT;
 import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.REPLICA_REJECT;
-import static com.linkedin.kafka.cruisecontrol.analyzer.ActionType.REPLICA_SWAP;
 import static com.linkedin.kafka.cruisecontrol.analyzer.AnalyzerUtils.EPSILON;
 
 
@@ -60,15 +60,6 @@ public class TopicReplicaDistributionGoal extends AbstractGoal {
   }
 
   /**
-   * @deprecated
-   * Please use {@link #actionAcceptance(BalancingAction, ClusterModel)} instead.
-   */
-  @Override
-  public boolean isActionAcceptable(BalancingAction action, ClusterModel clusterModel) {
-    return actionAcceptance(action, clusterModel) == ACCEPT;
-  }
-
-  /**
    * Check whether given action is acceptable by this goal. An action is acceptable if the number of topic replicas
    * at the source broker are more than the number of topic replicas at the destination (remote) broker.
    *
@@ -81,17 +72,73 @@ public class TopicReplicaDistributionGoal extends AbstractGoal {
   public ActionAcceptance actionAcceptance(BalancingAction action, ClusterModel clusterModel) {
     switch (action.balancingAction()) {
       case REPLICA_SWAP:
-        return ACCEPT;
+        if (action.topic().equals(action.destinationTopic())) {
+          return ACCEPT;
+        }
+        return varianceSum(clusterModel, action, true)
+               >= varianceSum(clusterModel, action, false) ? ACCEPT : REPLICA_REJECT;
       case LEADERSHIP_MOVEMENT:
+        return ACCEPT;
       case REPLICA_MOVEMENT:
-        String topic = action.topic();
-        int numLocalTopicReplicas = clusterModel.broker(action.sourceBrokerId()).replicasOfTopicInBroker(topic).size();
-        int numRemoteTopicReplicas = clusterModel.broker(action.destinationBrokerId()).replicasOfTopicInBroker(topic).size();
-
-        return numRemoteTopicReplicas < numLocalTopicReplicas ? ACCEPT : REPLICA_REJECT;
+        String sourceTopic = action.topic();
+        Broker sourceBroker = clusterModel.broker(action.sourceBrokerId());
+        Broker destinationBroker = clusterModel.broker(action.destinationBrokerId());
+        int numSourceTopicReplicasOnSourceBroker = sourceBroker.replicasOfTopicInBroker(sourceTopic).size();
+        int numSourceTopicReplicasOnDestinationBroker = destinationBroker.replicasOfTopicInBroker(sourceTopic).size();
+        return numSourceTopicReplicasOnDestinationBroker < numSourceTopicReplicasOnSourceBroker ? ACCEPT : REPLICA_REJECT;
       default:
         throw new IllegalArgumentException("Unsupported balancing action " + action.balancingAction() + " is provided.");
     }
+  }
+
+  /**
+   * Get the sum of variances of the topic replicas defined in the source and the destination of the given swap action.
+   * The result to be returned is before or after the swap action depending on the value of isBeforeSwap parameter.
+   *
+   * @param clusterModel The state of the cluster.
+   * @param swapAction Swap action.
+   * @param isBeforeSwap True if before the variance calculation before the swap is requested, false otherwise.
+   * @return the sum of variances of the topic replicas defined in the source and the destination of the swap action.
+   */
+  private static double varianceSum(ClusterModel clusterModel, BalancingAction swapAction, boolean isBeforeSwap) {
+    String sourceTopic = swapAction.topic();
+    String destinationTopic = swapAction.destinationTopic();
+    Broker sourceBroker = clusterModel.broker(swapAction.sourceBrokerId());
+    Broker destinationBroker = clusterModel.broker(swapAction.destinationBrokerId());
+    int numSourceTopicReplicasOnSourceBroker = sourceBroker.replicasOfTopicInBroker(sourceTopic).size();
+    int numSourceTopicReplicasOnDestinationBroker = destinationBroker.replicasOfTopicInBroker(sourceTopic).size();
+    int numDestinationTopicReplicasOnSourceBroker = sourceBroker.replicasOfTopicInBroker(destinationTopic).size();
+    int numDestinationTopicReplicasOnDestinationBroker = destinationBroker.replicasOfTopicInBroker(destinationTopic).size();
+
+    return varianceSum(clusterModel,
+                    destinationTopic,
+                    isBeforeSwap ? numDestinationTopicReplicasOnSourceBroker
+                                 : numDestinationTopicReplicasOnSourceBroker + 1,
+                    isBeforeSwap ? numDestinationTopicReplicasOnDestinationBroker
+                                 : numDestinationTopicReplicasOnDestinationBroker - 1)
+           + varianceSum(clusterModel,
+                      sourceTopic,
+                      isBeforeSwap ? numSourceTopicReplicasOnSourceBroker
+                                   : numSourceTopicReplicasOnSourceBroker - 1,
+                      isBeforeSwap ? numSourceTopicReplicasOnDestinationBroker
+                                   : numSourceTopicReplicasOnDestinationBroker + 1);
+  }
+
+  /**
+   * Get the sum of variances for the given number of topic replicas on brokers.
+   *
+   * @param clusterModel The state of the cluster.
+   * @param topic The topic for which the variance contribution will be calculated.
+   * @param numTopicReplicasOnBroker1 Number of topic replicas on the first broker.
+   * @param numTopicReplicasOnBroker2 Number of topic replicas on the second broker.
+   * @return the sum of variances for the given number of topic replicas on brokers.
+   */
+  private static double varianceSum(ClusterModel clusterModel,
+                                    String topic,
+                                    int numTopicReplicasOnBroker1,
+                                    int numTopicReplicasOnBroker2) {
+    double avgTopicReplicas = ((double) clusterModel.numTopicReplicas(topic)) / clusterModel.aliveBrokers().size();
+    return Math.pow(numTopicReplicasOnBroker1 - avgTopicReplicas, 2) + Math.pow(numTopicReplicasOnBroker2 - avgTopicReplicas, 2);
   }
 
   @Override
@@ -175,7 +222,7 @@ public class TopicReplicaDistributionGoal extends AbstractGoal {
 
     _replicaDistributionTargetByTopic = new HashMap<>();
 
-    Set<Broker> brokers = clusterModel.healthyBrokers();
+    Set<Broker> brokers = clusterModel.aliveBrokers();
     // Populate a map of replica distribution target by each non-excluded topic in the cluster.
     for (String topic : _topicsToRebalance) {
       ReplicaDistributionTarget replicaDistributionTarget =
@@ -219,14 +266,17 @@ public class TopicReplicaDistributionGoal extends AbstractGoal {
    *
    * @param clusterModel   The state of the cluster.
    * @param optimizedGoals Optimized goals.
+   * @param optimizationOptions Options to take into account during optimization.
    */
-  private void healCluster(ClusterModel clusterModel, Set<Goal> optimizedGoals) throws OptimizationFailureException {
+  private void healCluster(ClusterModel clusterModel,
+                           Set<Goal> optimizedGoals,
+                           OptimizationOptions optimizationOptions) throws OptimizationFailureException {
     // Move self healed replicas (if their broker is overloaded or they reside at dead brokers) to eligible ones.
     for (Replica replica : clusterModel.selfHealingEligibleReplicas()) {
       String topic = replica.topicPartition().topic();
       ReplicaDistributionTarget replicaDistributionTarget = _replicaDistributionTargetByTopic.get(topic);
       replicaDistributionTarget.moveSelfHealingEligibleReplicaToEligibleBroker(clusterModel, replica,
-          replica.broker().replicasOfTopicInBroker(topic).size(), optimizedGoals);
+          replica.broker().replicasOfTopicInBroker(topic).size(), optimizedGoals, optimizationOptions);
     }
   }
 
@@ -236,16 +286,16 @@ public class TopicReplicaDistributionGoal extends AbstractGoal {
    * @param broker         Broker to be balanced.
    * @param clusterModel   The state of the cluster.
    * @param optimizedGoals Optimized goals.
-   * @param excludedTopics The topics that should be excluded from the optimization action.
+   * @param optimizationOptions Options to take into account during optimization -- e.g. excluded topics.
    */
   @Override
   protected void rebalanceForBroker(Broker broker,
                                     ClusterModel clusterModel,
                                     Set<Goal> optimizedGoals,
-                                    Set<String> excludedTopics) throws OptimizationFailureException {
+                                    OptimizationOptions optimizationOptions) throws OptimizationFailureException {
 
     if (!clusterModel.selfHealingEligibleReplicas().isEmpty() && !broker.isAlive() && !broker.replicas().isEmpty()) {
-      healCluster(clusterModel, optimizedGoals);
+      healCluster(clusterModel, optimizedGoals, optimizationOptions);
     } else {
       SortedSet<Replica> topicReplicasInBroker = new TreeSet<>(broker.replicasOfTopicInBroker(_currentRebalanceTopic));
       // Move local topic replicas to eligible brokers.
@@ -253,7 +303,7 @@ public class TopicReplicaDistributionGoal extends AbstractGoal {
                                        .moveReplicasInSourceBrokerToEligibleBrokers(clusterModel,
                                                                                     topicReplicasInBroker,
                                                                                     optimizedGoals,
-                                                                                    excludedTopics);
+                                                                                    optimizationOptions);
     }
   }
 

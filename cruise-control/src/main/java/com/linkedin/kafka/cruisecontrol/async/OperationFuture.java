@@ -4,28 +4,27 @@
 
 package com.linkedin.kafka.cruisecontrol.async;
 
+import com.linkedin.kafka.cruisecontrol.servlet.response.CruiseControlResponse;
 import com.linkedin.kafka.cruisecontrol.async.progress.OperationProgress;
 import java.lang.reflect.Field;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 
 /**
  * The future to support async operations in KafkaCruiseControl
- * @param <T> the return type.
  */
-public class OperationFuture<T> extends CompletableFuture<T> {
-  private static final Logger LOG = LoggerFactory.getLogger(OperationFuture.class);
+public class OperationFuture extends CompletableFuture<CruiseControlResponse> {
   // The url encoded request url
   private final String _operation;
   private final OperationProgress _operationProgress;
   private volatile Thread _executionThread = null;
+  private long _finishTimeNs;
 
   public OperationFuture(String operation) {
-    _operation = "'" + operation + "'";
+    _operation = operation;
     _operationProgress = new OperationProgress();
+    _finishTimeNs = -1;
   }
 
   @Override
@@ -44,7 +43,7 @@ public class OperationFuture<T> extends CompletableFuture<T> {
   }
 
   @Override
-  public T get() throws InterruptedException, ExecutionException {
+  public CruiseControlResponse get() throws InterruptedException, ExecutionException {
     try {
       return super.get();
     } catch (Throwable t) {
@@ -92,9 +91,31 @@ public class OperationFuture<T> extends CompletableFuture<T> {
   }
 
   /**
+   * @return the array describing the progress of the operation.
+   */
+  public Object[] getJsonArray() {
+    return _operationProgress.getJsonArray();
+  }
+
+  /**
    * @return the {@link OperationProgress} of this operation.
    */
   public OperationProgress operationProgress() {
      return _operationProgress;
+  }
+
+  /**
+   * Record the finish time of this operation, invoked at the end of corresponding {@link OperationRunnable#run()}.
+   * @param finishTimeNs the system time when this operation completes.
+   */
+  public void setFinishTimeNs(long finishTimeNs) {
+    _finishTimeNs = finishTimeNs;
+  }
+
+  /**
+   * @return the integer representing the finish time of this operation.
+   */
+  public long finishTimeNs() {
+    return _finishTimeNs;
   }
 }

@@ -15,18 +15,16 @@ import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModelStats;
 
 import java.lang.reflect.Constructor;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
-import java.util.SortedMap;
 import java.util.StringJoiner;
-import java.util.TreeMap;
 
 import com.linkedin.kafka.cruisecontrol.model.Replica;
-import java.util.stream.Collectors;
 import org.apache.kafka.common.utils.SystemTime;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -67,7 +65,7 @@ class OptimizationVerifier {
    */
   static boolean executeGoalsFor(BalancingConstraint constraint,
                                  ClusterModel clusterModel,
-                                 Map<Integer, String> goalNameByPriority,
+                                 List<String> goalNameByPriority,
                                  List<Verification> verifications) throws Exception {
     return executeGoalsFor(constraint, clusterModel, goalNameByPriority, Collections.emptySet(), verifications);
   }
@@ -87,28 +85,26 @@ class OptimizationVerifier {
    * @param verifications      The verifications to make after the optimization.
    * @return Pass / fail status of a test.
    */
+  @SuppressWarnings("unchecked")
   static boolean executeGoalsFor(BalancingConstraint constraint,
                                  ClusterModel clusterModel,
-                                 Map<Integer, String> goalNameByPriority,
+                                 List<String> goalNameByPriority,
                                  Collection<String> excludedTopics,
                                  List<Verification> verifications) throws Exception {
     // Get the initial stats from the cluster.
     ClusterModelStats preOptimizedStats = clusterModel.getClusterStats(constraint);
 
     // Set goals by their priority.
-    SortedMap<Integer, Goal> goalByPriority = new TreeMap<>();
-    for (Map.Entry<Integer, String> goalEntry : goalNameByPriority.entrySet()) {
-      Integer priority = goalEntry.getKey();
-      String goalClassName = goalEntry.getValue();
-
+    List<Goal> goalByPriority = new ArrayList<>(goalNameByPriority.size());
+    for (String goalClassName : goalNameByPriority) {
       Class<? extends Goal> goalClass = (Class<? extends Goal>) Class.forName(goalClassName);
       try {
         Constructor<? extends Goal> constructor = goalClass.getDeclaredConstructor(BalancingConstraint.class);
         constructor.setAccessible(true);
-        goalByPriority.put(priority, constructor.newInstance(constraint));
+        goalByPriority.add(constructor.newInstance(constraint));
       } catch (NoSuchMethodException badConstructor) {
         //Try default constructor
-        goalByPriority.put(priority, goalClass.newInstance());
+        goalByPriority.add(goalClass.newInstance());
       }
     }
 
@@ -125,8 +121,10 @@ class OptimizationVerifier {
     GoalOptimizer.OptimizerResult optimizerResult = goalOptimizer.optimizations(clusterModel,
                                                                                 goalByPriority,
                                                                                 new OperationProgress());
-    LOG.trace("Took {} ms to execute {} to generate {} proposals.", System.currentTimeMillis() - startTime,
-              goalByPriority, optimizerResult.goalProposals().size());
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Took {} ms to execute {} to generate {} proposals.", System.currentTimeMillis() - startTime,
+                goalByPriority, optimizerResult.goalProposals().size());
+    }
 
     for (Verification verification : verifications) {
       switch (verification) {
@@ -160,12 +158,8 @@ class OptimizationVerifier {
 
   private static boolean verifyGoalViolations(GoalOptimizer.OptimizerResult optimizerResult) {
     // Check if there are still goals violated after the optimization.
-    Set<String> violatedGoals = optimizerResult.violatedGoalsAfterOptimization()
-                                               .stream()
-                                               .map(Goal::name)
-                                               .collect(Collectors.toSet());
-    if (!violatedGoals.isEmpty()) {
-      LOG.error("Failed to optimize goal {}", violatedGoals);
+    if (!optimizerResult.violatedGoalsAfterOptimization().isEmpty()) {
+      LOG.error("Failed to optimize goal {}", optimizerResult.violatedGoalsAfterOptimization());
       System.out.println(optimizerResult.clusterModelStats().toString());
       return false;
     } else {
@@ -175,7 +169,7 @@ class OptimizationVerifier {
 
   private static boolean verifyDeadBrokers(ClusterModel clusterModel) {
     Set<Broker> deadBrokers = clusterModel.brokers();
-    deadBrokers.removeAll(clusterModel.healthyBrokers());
+    deadBrokers.removeAll(clusterModel.aliveBrokers());
     for (Broker deadBroker : deadBrokers) {
       if (deadBroker.replicas().size() > 0) {
         LOG.error("Failed to move {} replicas on dead broker {} to other brokers.", deadBroker.replicas().size(),
@@ -187,7 +181,7 @@ class OptimizationVerifier {
   }
 
   private static boolean verifyNewBrokers(ClusterModel clusterModel, BalancingConstraint constraint) {
-    for (Broker broker : clusterModel.healthyBrokers()) {
+    for (Broker broker : clusterModel.aliveBrokers()) {
       if (!broker.isNew()) {
         for (Replica replica : broker.replicas()) {
           if (replica.originalBroker() != broker) {
@@ -215,13 +209,15 @@ class OptimizationVerifier {
   private static boolean verifyRegression(GoalOptimizer.OptimizerResult optimizerResult,
                                           ClusterModelStats preOptimizationStats) {
     // Check whether test has failed for rebalance: fails if rebalance caused a worse goal state after rebalance.
-    Map<Goal, ClusterModelStats> clusterStatsByPriority = optimizerResult.statsByGoalPriority();
+    Map<String, ClusterModelStats> statsByGoalName = optimizerResult.statsByGoalName();
+    Map<String, Goal.ClusterModelStatsComparator> clusterModelStatsComparatorByGoalName
+        = optimizerResult.clusterModelStatsComparatorByGoalName();
     ClusterModelStats preStats = preOptimizationStats;
-    for (Map.Entry<Goal, ClusterModelStats> entry : clusterStatsByPriority.entrySet()) {
-      Goal.ClusterModelStatsComparator comparator = entry.getKey().clusterModelStatsComparator();
+    for (Map.Entry<String, ClusterModelStats> entry : statsByGoalName.entrySet()) {
+      Goal.ClusterModelStatsComparator comparator = clusterModelStatsComparatorByGoalName.get(entry.getKey());
       boolean success = comparator.compare(entry.getValue(), preStats) >= 0;
       if (!success) {
-        LOG.error("Failed goal comparison " + entry.getKey().name() + ". " + comparator.explainLastComparison());
+        LOG.error("Failed goal comparison " + entry.getKey() + ". " + comparator.explainLastComparison());
         return false;
       }
       preStats = entry.getValue();

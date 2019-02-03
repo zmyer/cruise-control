@@ -5,6 +5,7 @@
 
 package com.linkedin.kafka.cruisecontrol.analyzer.goals;
 
+import com.linkedin.kafka.cruisecontrol.analyzer.OptimizationOptions;
 import com.linkedin.kafka.cruisecontrol.analyzer.AnalyzerUtils;
 import com.linkedin.kafka.cruisecontrol.analyzer.BalancingAction;
 import com.linkedin.kafka.cruisecontrol.analyzer.ActionType;
@@ -22,6 +23,8 @@ import java.util.SortedSet;
 import java.util.stream.Collectors;
 
 import static com.linkedin.kafka.cruisecontrol.analyzer.ActionAcceptance.ACCEPT;
+import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.isEligibleForReplicaMove;
+import static com.linkedin.kafka.cruisecontrol.analyzer.goals.GoalUtils.legitMove;
 
 
 /**
@@ -51,11 +54,11 @@ class ReplicaDistributionTarget {
    *
    * @param numReplicasToBalance The number of replicas to balance. In case replicas to be balanced are for specific
    *                             topic, this number indicates the number of replicas of this topic in the cluster.
-   * @param healthyBrokers       Healthy brokers in the cluster -- i.e. brokers that are not dead.
+   * @param aliveBrokers       Alive brokers in the cluster -- i.e. brokers that are not dead.
    */
-  ReplicaDistributionTarget(int numReplicasToBalance, Set<Broker> healthyBrokers) {
-    _minNumReplicasPerBroker = numReplicasToBalance / healthyBrokers.size();
-    _warmBrokerCredits = numReplicasToBalance % healthyBrokers.size();
+  ReplicaDistributionTarget(int numReplicasToBalance, Set<Broker> aliveBrokers) {
+    _minNumReplicasPerBroker = numReplicasToBalance / aliveBrokers.size();
+    _warmBrokerCredits = numReplicasToBalance % aliveBrokers.size();
     _requiredNumReplicasByBrokerId = new HashMap<>();
     _secondaryEligibleBrokerIds = new HashSet<>();
     _consumedWarmBrokerCredits = 0;
@@ -69,30 +72,31 @@ class ReplicaDistributionTarget {
   }
 
   /**
-   * Move replicas residing in the given cluster and given healthy source broker having given set of topic partitions
+   * Move replicas residing in the given cluster and given alive source broker having given set of topic partitions
    * to eligible brokers. Replica movements are guaranteed not to violate the requirements of optimized goals.
    *
    * @param clusterModel           The state of the cluster.
    * @param replicasInBrokerToMove Replicas to move from the given source broker.
    * @param optimizedGoals         Goals that have already been optimized. The function ensures that their requirements won't
    *                               be violated.
-   * @param excludedTopics The topics that should be excluded from the optimization action.
+   * @param optimizationOptions Options to take into account during optimization.
    */
   boolean moveReplicasInSourceBrokerToEligibleBrokers(ClusterModel clusterModel,
                                                       SortedSet<Replica> replicasInBrokerToMove,
                                                       Set<Goal> optimizedGoals,
-                                                      Set<String> excludedTopics) {
+                                                      OptimizationOptions optimizationOptions) {
     // Get number of replicas to move from the local to a remote broker to achieve the distribution target.
     int numReplicasToMove = numReplicasToMove(replicasInBrokerToMove.size());
     if (numReplicasToMove == 0) {
       return true;
     }
 
+    Set<String> excludedTopics = optimizationOptions.excludedTopics();
     for (Replica replicaToMove : replicasInBrokerToMove) {
       if (excludedTopics.contains(replicaToMove.topicPartition().topic()) && replicaToMove.originalBroker().isAlive()) {
         continue;
       }
-      if (moveReplicaToEligibleBroker(clusterModel, replicaToMove, optimizedGoals)) {
+      if (moveReplicaToEligibleBroker(clusterModel, replicaToMove, optimizedGoals, optimizationOptions)) {
         numReplicasToMove--;
         // Check if any more replicas need to move.
         if (numReplicasToMove == 0) {
@@ -108,7 +112,7 @@ class ReplicaDistributionTarget {
   }
 
   /**
-   * Move given self healing eligible replica residing in the given cluster in a dead or healthy broker to an eligible
+   * Move given self healing eligible replica residing in the given cluster in a dead or alive broker to an eligible
    * broker. Replica movements are guaranteed not to violate the requirements of optimized goals.
    *
    * @param clusterModel     The state of the cluster.
@@ -116,11 +120,13 @@ class ReplicaDistributionTarget {
    * @param numLocalReplicas Number of local replicas.
    * @param optimizedGoals   Goals that have already been optimized. The function ensures that their requirements won't
    *                         be violated.
+   * @param optimizationOptions Options to take into account during optimization.
    */
   void moveSelfHealingEligibleReplicaToEligibleBroker(ClusterModel clusterModel,
                                                       Replica replicaToMove,
                                                       int numLocalReplicas,
-                                                      Set<Goal> optimizedGoals)
+                                                      Set<Goal> optimizedGoals,
+                                                      OptimizationOptions optimizationOptions)
       throws OptimizationFailureException {
     // Sanity check the number of replicas to move from the local to a remote broker to achieve the distribution
     // target. If the broker is dead, the replica must move to another broker.
@@ -129,13 +135,13 @@ class ReplicaDistributionTarget {
     }
 
     // Attempt to move the replica to an eligible broker.
-    boolean isMoveSuccessful = moveReplicaToEligibleBroker(clusterModel, replicaToMove, optimizedGoals);
+    boolean isMoveSuccessful = moveReplicaToEligibleBroker(clusterModel, replicaToMove, optimizedGoals, optimizationOptions);
     if (!replicaToMove.broker().isAlive()) {
       throw new OptimizationFailureException("Self healing failed to move the replica away from decommissioned broker.");
     }
 
     // Update consumed warm broker credits. Credit is consumed because the broker was unable to move replicas.
-    if (isMoveSuccessful) {
+    if (!isMoveSuccessful) {
       _consumedWarmBrokerCredits++;
     }
   }
@@ -212,55 +218,51 @@ class ReplicaDistributionTarget {
    * @param replicaToMove  Replica to move away from its current broker.
    * @param optimizedGoals Goals that have already been optimized. The function ensures that their requirements won't
    *                       be violated.
+   * @param optimizationOptions Options to take into account during optimization -- e.g. excluded topics.
    * @return True if replica move succeeds, false otherwise.
    */
-  private boolean moveReplicaToEligibleBroker(ClusterModel clusterModel, Replica replicaToMove, Set<Goal> optimizedGoals) {
+  private boolean moveReplicaToEligibleBroker(ClusterModel clusterModel,
+                                              Replica replicaToMove,
+                                              Set<Goal> optimizedGoals,
+                                              OptimizationOptions optimizationOptions) {
     boolean isMoveSuccessful = false;
     // Get eligible brokers to receive this replica.
-    for (int brokerId : replicaToMove.broker().isAlive()
-                        ? sortedCandidateBrokerIds()
-                        : clusterModel.healthyBrokers().stream().map(Broker::id).collect(Collectors.toList())) {
+    for (int candidateBrokerId : replicaToMove.broker().isAlive()
+                                 ? sortedCandidateBrokerIds()
+                                 : clusterModel.aliveBrokers().stream().map(Broker::id).collect(Collectors.toList())) {
       // filter out the broker that is not eligible.
-      if (!isEligibleForReplica(clusterModel, replicaToMove, brokerId)) {
+      if (!isEligibleForReplicaMove(clusterModel, replicaToMove, candidateBrokerId, optimizationOptions)) {
         continue;
       }
       // Check if movement is acceptable by this and optimized goals. Movement is acceptable by (1) this goal
       // if the eligible destination broker does not contain a replica in the same partition set, (2) optimized
       // goals if for each optimized goal accepts the replica movement action.
-      BalancingAction optimizedGoalProposal =
-          new BalancingAction(replicaToMove.topicPartition(), replicaToMove.broker().id(), brokerId,
+      BalancingAction proposal =
+          new BalancingAction(replicaToMove.topicPartition(), replicaToMove.broker().id(), candidateBrokerId,
                               ActionType.REPLICA_MOVEMENT);
-      boolean canMove = (clusterModel.broker(brokerId).replica(replicaToMove.topicPartition()) == null)
-                        && AnalyzerUtils.isProposalAcceptableForOptimizedGoals(
-                            optimizedGoals, optimizedGoalProposal, clusterModel) == ACCEPT;
+      if (!legitMove(replicaToMove, clusterModel.broker(candidateBrokerId), ActionType.REPLICA_MOVEMENT)) {
+        continue;
+      }
+
+      boolean canMove = AnalyzerUtils.isProposalAcceptableForOptimizedGoals(optimizedGoals, proposal, clusterModel) == ACCEPT;
       if (canMove) {
-        clusterModel.relocateReplica(replicaToMove.topicPartition(), replicaToMove.broker().id(), brokerId);
+        clusterModel.relocateReplica(replicaToMove.topicPartition(), replicaToMove.broker().id(), candidateBrokerId);
         isMoveSuccessful = true;
         // Consume an eligible broker id.
-        Integer requiredNumReplicas = _requiredNumReplicasByBrokerId.get(brokerId);
+        Integer requiredNumReplicas = _requiredNumReplicasByBrokerId.get(candidateBrokerId);
         if (requiredNumReplicas != null) {
           if (requiredNumReplicas == 1) {
-            _requiredNumReplicasByBrokerId.remove(brokerId);
+            _requiredNumReplicasByBrokerId.remove(candidateBrokerId);
           } else {
             requiredNumReplicas--;
-            _requiredNumReplicasByBrokerId.put(brokerId, requiredNumReplicas);
+            _requiredNumReplicasByBrokerId.put(candidateBrokerId, requiredNumReplicas);
           }
         } else {
-          _secondaryEligibleBrokerIds.remove(brokerId);
+          _secondaryEligibleBrokerIds.remove(candidateBrokerId);
         }
         break;
       }
     }
     return isMoveSuccessful;
-  }
-
-  private boolean isEligibleForReplica(ClusterModel clusterModel,
-                                       Replica replica,
-                                       int candidateBrokerId) {
-    Set<Broker> newBrokers = clusterModel.newBrokers();
-    Broker candidateBroker = clusterModel.broker(candidateBrokerId);
-    return newBrokers.isEmpty()
-        || candidateBroker.isNew()
-        || replica.originalBroker() == candidateBroker;
   }
 }

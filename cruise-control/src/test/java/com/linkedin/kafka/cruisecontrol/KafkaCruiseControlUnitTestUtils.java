@@ -12,13 +12,8 @@ import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.monitor.metricdefinition.KafkaMetricDef;
 import com.linkedin.kafka.cruisecontrol.monitor.sampling.NoopSampler;
 
-import java.nio.charset.StandardCharsets;
 import java.util.Properties;
-import kafka.utils.ZkUtils;
-import org.I0Itec.zkclient.ZkClient;
-import org.I0Itec.zkclient.ZkConnection;
-import org.I0Itec.zkclient.exception.ZkMarshallingError;
-import org.I0Itec.zkclient.serialize.ZkSerializer;
+import java.util.concurrent.TimeUnit;
 
 
 /**
@@ -40,26 +35,27 @@ public class KafkaCruiseControlUnitTestUtils {
     props.setProperty(BrokerCapacityConfigFileResolver.CAPACITY_CONFIG_FILE, capacityConfigFile);
     props.setProperty(KafkaCruiseControlConfig.MIN_SAMPLES_PER_PARTITION_METRICS_WINDOW_CONFIG, "2");
     props.setProperty(KafkaCruiseControlConfig.MIN_SAMPLES_PER_BROKER_METRICS_WINDOW_CONFIG, "2");
+    props.setProperty(KafkaCruiseControlConfig.COMPLETED_USER_TASK_RETENTION_TIME_MS_CONFIG, Long.toString(TimeUnit.HOURS.toMillis(6)));
+    props.setProperty(KafkaCruiseControlConfig.DEMOTION_HISTORY_RETENTION_TIME_MS_CONFIG, Long.toString(TimeUnit.HOURS.toMillis(24)));
+    props.setProperty(KafkaCruiseControlConfig.REMOVAL_HISTORY_RETENTION_TIME_MS_CONFIG, Long.toString(TimeUnit.HOURS.toMillis(12)));
+    props.setProperty(
+        KafkaCruiseControlConfig.DEFAULT_GOALS_CONFIG,
+        "com.linkedin.kafka.cruisecontrol.analyzer.goals.RackAwareGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.ReplicaCapacityGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.DiskCapacityGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.NetworkInboundCapacityGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.NetworkOutboundCapacityGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.CpuCapacityGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.ReplicaDistributionGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.PotentialNwOutGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.DiskUsageDistributionGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.NetworkInboundUsageDistributionGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.NetworkOutboundUsageDistributionGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.CpuUsageDistributionGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.LeaderBytesInDistributionGoal,"
+        + "com.linkedin.kafka.cruisecontrol.analyzer.goals.TopicReplicaDistributionGoal");
+
     return props;
-  }
-
-  public static ZkUtils zkUtils(String zkConnect) {
-    ZkConnection zkConnection = new ZkConnection(zkConnect, 30000);
-    ZkClient zkClient = new ZkClient(zkConnection, 30000, new ZKStringSerializer());
-    return new ZkUtils(zkClient, zkConnection, false);
-  }
-
-  private static class ZKStringSerializer implements ZkSerializer {
-
-    @Override
-    public byte[] serialize(Object data) throws ZkMarshallingError {
-      return ((String) data).getBytes(StandardCharsets.UTF_8);
-    }
-
-    @Override
-    public Object deserialize(byte[] bytes) throws ZkMarshallingError {
-      return bytes == null ? null : new String(bytes, StandardCharsets.UTF_8);
-    }
   }
 
   /**

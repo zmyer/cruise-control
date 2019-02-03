@@ -13,11 +13,13 @@ import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.common.KafkaCruiseControlThreadFactory;
 import com.linkedin.kafka.cruisecontrol.detector.notifier.AnomalyNotificationResult;
 import com.linkedin.kafka.cruisecontrol.detector.notifier.AnomalyNotifier;
+import com.linkedin.kafka.cruisecontrol.detector.notifier.AnomalyType;
 import com.linkedin.kafka.cruisecontrol.exception.KafkaCruiseControlException;
 import com.linkedin.kafka.cruisecontrol.executor.ExecutorState;
 import com.linkedin.kafka.cruisecontrol.monitor.LoadMonitor;
 import com.linkedin.kafka.cruisecontrol.monitor.task.LoadMonitorTaskRunner;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Random;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingDeque;
@@ -27,13 +29,21 @@ import org.apache.kafka.common.utils.Time;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static com.linkedin.kafka.cruisecontrol.servlet.response.CruiseControlState.SubState.EXECUTOR;
+
 
 /**
  * The anomaly detector class that helps detect and handle anomalies.
  */
 public class AnomalyDetector {
+  private static final String METRIC_REGISTRY_NAME = "AnomalyDetector";
+  private static final int INIT_JITTER_BOUND = 10000;
   private static final Logger LOG = LoggerFactory.getLogger(AnomalyDetector.class);
-  private static final Anomaly SHUTDOWN_ANOMALY = new BrokerFailures(null, Collections.emptyMap());
+  private static final Anomaly SHUTDOWN_ANOMALY = new BrokerFailures(null,
+                                                                     Collections.emptyMap(),
+                                                                     true,
+                                                                     true,
+                                                                     true);
   private final KafkaCruiseControl _kafkaCruiseControl;
   private final AnomalyNotifier _anomalyNotifier;
   // Detectors
@@ -48,6 +58,7 @@ public class AnomalyDetector {
   private final Meter _goalViolationRate;
   private final Meter _metricAnomalyRate;
   private final LoadMonitor _loadMonitor;
+  private final AnomalyDetectorState _anomalyDetectorState;
 
   public AnomalyDetector(KafkaCruiseControlConfig config,
                          LoadMonitor loadMonitor,
@@ -64,11 +75,14 @@ public class AnomalyDetector {
     _brokerFailureDetector = new BrokerFailureDetector(config, _loadMonitor, _anomalies, time, _kafkaCruiseControl);
     _metricAnomalyDetector = new MetricAnomalyDetector(config, _loadMonitor, _anomalies, _kafkaCruiseControl);
     _detectorScheduler =
-        Executors.newScheduledThreadPool(4, new KafkaCruiseControlThreadFactory("AnomalyDetector", false, LOG));
+        Executors.newScheduledThreadPool(4, new KafkaCruiseControlThreadFactory(METRIC_REGISTRY_NAME, false, LOG));
     _shutdown = false;
-    _brokerFailureRate = dropwizardMetricRegistry.meter(MetricRegistry.name("AnomalyDetector", "broker-failure-rate"));
-    _goalViolationRate = dropwizardMetricRegistry.meter(MetricRegistry.name("AnomalyDetector", "goal-violation-rate"));
-    _metricAnomalyRate = dropwizardMetricRegistry.meter(MetricRegistry.name("AnomalyDetector", "metric-anomaly-rate"));
+    _brokerFailureRate = dropwizardMetricRegistry.meter(MetricRegistry.name(METRIC_REGISTRY_NAME, "broker-failure-rate"));
+    _goalViolationRate = dropwizardMetricRegistry.meter(MetricRegistry.name(METRIC_REGISTRY_NAME, "goal-violation-rate"));
+    _metricAnomalyRate = dropwizardMetricRegistry.meter(MetricRegistry.name(METRIC_REGISTRY_NAME, "metric-anomaly-rate"));
+    // Add anomaly detector state
+    int numCachedRecentAnomalyStates = config.getInt(KafkaCruiseControlConfig.NUM_CACHED_RECENT_ANOMALY_STATES_CONFIG);
+    _anomalyDetectorState = new AnomalyDetectorState(_anomalyNotifier.selfHealingEnabled(), numCachedRecentAnomalyStates);
   }
 
   /**
@@ -96,18 +110,20 @@ public class AnomalyDetector {
     _goalViolationRate = new Meter();
     _metricAnomalyRate = new Meter();
     _loadMonitor = loadMonitor;
+    // Add anomaly detector state
+    _anomalyDetectorState = new AnomalyDetectorState(new HashMap<>(AnomalyType.cachedValues().size()), 10);
   }
 
   public void startDetection() {
     LOG.info("Starting anomaly detector.");
     _brokerFailureDetector.startDetection();
-    int jitter = new Random().nextInt(10000);
+    int jitter = new Random().nextInt(INIT_JITTER_BOUND);
     LOG.debug("Starting goal violation detector with delay of {} ms", jitter);
     _detectorScheduler.scheduleAtFixedRate(_goalViolationDetector,
                                            _anomalyDetectionIntervalMs / 2 + jitter,
                                            _anomalyDetectionIntervalMs,
                                            TimeUnit.MILLISECONDS);
-    jitter = new Random().nextInt(10000);
+    jitter = new Random().nextInt(INIT_JITTER_BOUND);
     LOG.debug("Starting metric anomaly detector with delay of {} ms", jitter);
     _detectorScheduler.scheduleAtFixedRate(_metricAnomalyDetector,
                                            _anomalyDetectionIntervalMs / 2 + jitter,
@@ -137,6 +153,24 @@ public class AnomalyDetector {
     LOG.info("Anomaly detector shutdown completed.");
   }
 
+  public AnomalyDetectorState anomalyDetectorState() {
+    return _anomalyDetectorState;
+  }
+
+  /**
+   * (1) Enable or disable self healing for the given anomaly type and (2) update the cached anomaly detector state.
+   *
+   * @param anomalyType Type of anomaly for which to enable or disable self healing.
+   * @param isSelfHealingEnabled True if self healing is enabled, false otherwise.
+   * @return The old value of self healing for the given anomaly type.
+   */
+  public boolean setSelfHealingFor(AnomalyType anomalyType, boolean isSelfHealingEnabled) {
+    boolean oldSelfHealingEnabled = _anomalyNotifier.setSelfHealingFor(anomalyType, isSelfHealingEnabled);
+    _anomalyDetectorState.setSelfHealingFor(anomalyType, isSelfHealingEnabled);
+
+    return oldSelfHealingEnabled;
+  }
+
   /**
    * A class that handles all the anomalies.
    */
@@ -155,7 +189,8 @@ public class AnomalyDetector {
             break;
           }
           // We schedule a delayed check if the executor is doing some work.
-          ExecutorState.State executorState = _kafkaCruiseControl.state(new OperationProgress()).executorState().state();
+          ExecutorState.State executorState = _kafkaCruiseControl.state(
+              new OperationProgress(), Collections.singleton(EXECUTOR)).executorState().state();
           if (executorState != ExecutorState.State.NO_TASK_IN_PROGRESS) {
             LOG.debug("Schedule delayed check for anomaly {} because executor is in {} state", anomaly, executorState);
             checkWithDelay(anomaly, _anomalyDetectionIntervalMs);
@@ -164,14 +199,17 @@ public class AnomalyDetector {
             // Call the anomaly notifier to see if a fix is desired.
             if (anomaly instanceof BrokerFailures) {
               BrokerFailures brokerFailures = (BrokerFailures) anomaly;
+              _anomalyDetectorState.addAnomaly(AnomalyType.BROKER_FAILURE, brokerFailures);
               notificationResult = _anomalyNotifier.onBrokerFailure(brokerFailures);
               _brokerFailureRate.mark();
             } else if (anomaly instanceof GoalViolations) {
               GoalViolations goalViolations = (GoalViolations) anomaly;
+              _anomalyDetectorState.addAnomaly(AnomalyType.GOAL_VIOLATION, goalViolations);
               notificationResult = _anomalyNotifier.onGoalViolation(goalViolations);
               _goalViolationRate.mark();
             } else if (anomaly instanceof KafkaMetricAnomaly) {
               KafkaMetricAnomaly metricAnomaly = (KafkaMetricAnomaly) anomaly;
+              _anomalyDetectorState.addAnomaly(AnomalyType.METRIC_ANOMALY, metricAnomaly);
               notificationResult = _anomalyNotifier.onMetricAnomaly(metricAnomaly);
               _metricAnomalyRate.mark();
             }
@@ -224,7 +262,17 @@ public class AnomalyDetector {
      * @return true if fixable, false otherwise.
      */
     private boolean isFixable(Anomaly anomaly) {
-      String skipMsg = (anomaly instanceof GoalViolations) ? "goal violation fix" : "broker failure fix";
+      String skipMsg;
+      if (anomaly instanceof GoalViolations) {
+        skipMsg = "goal violation fix";
+      } else if (anomaly instanceof BrokerFailures) {
+        skipMsg = "broker failure fix";
+      } else if (anomaly instanceof KafkaMetricAnomaly) {
+        skipMsg = "metric anomaly fix";
+      } else {
+        throw new IllegalArgumentException("Unrecognized anomaly.");
+      }
+
       LoadMonitorTaskRunner.LoadMonitorTaskRunnerState loadMonitorTaskRunnerState = _loadMonitor.taskRunnerState();
 
       // Fixing anomalies is possible only when (1) the state is not in and unavailable state ( e.g. loading or

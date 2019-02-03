@@ -8,6 +8,7 @@ import com.linkedin.cruisecontrol.metricdef.MetricDef;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.exception.MetricSamplingException;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.CruiseControlMetricsReporterConfig;
+import com.linkedin.kafka.cruisecontrol.metricsreporter.exception.UnknownVersionException;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.CruiseControlMetric;
 import com.linkedin.kafka.cruisecontrol.metricsreporter.metric.MetricSerde;
 import java.util.Collection;
@@ -88,7 +89,9 @@ public class CruiseControlMetricsReporterSampler implements MetricSampler {
         _metricConsumer.seek(tp, endOffsets.get(tp));
       }
     }
-    LOG.debug("Starting consuming from metrics reporter topic.");
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Starting consuming from metrics reporter topic partitions {}.", _metricConsumer.assignment());
+    }
     _metricConsumer.resume(_metricConsumer.paused());
     int totalMetricsAdded = 0;
     long maxTimeStamp = -1L;
@@ -118,7 +121,8 @@ public class CruiseControlMetricsReporterSampler implements MetricSampler {
         }
       }
     } while (!consumptionDone(endOffsets) && System.currentTimeMillis() < deadline);
-    LOG.info("Finished sampling for time range [{},{}]. Collected {} metrics.", startTimeMs, endTimeMs, totalMetricsAdded);
+    LOG.info("Finished sampling for topic partitions {} in time range [{},{}]. Collected {} metrics.",
+              _metricConsumer.assignment(), startTimeMs, endTimeMs, totalMetricsAdded);
 
     try {
       if (totalMetricsAdded > 0) {
@@ -126,6 +130,9 @@ public class CruiseControlMetricsReporterSampler implements MetricSampler {
       } else {
         return new Samples(Collections.emptySet(), Collections.emptySet());
       }
+    } catch (UnknownVersionException e) {
+      LOG.error("Unrecognized serde version detected during metric sampling.", e);
+      return new Samples(Collections.emptySet(), Collections.emptySet());
     } finally {
       METRICS_PROCESSOR.clear();
     }

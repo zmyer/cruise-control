@@ -9,6 +9,7 @@ import com.linkedin.kafka.cruisecontrol.KafkaCruiseControlUnitTestUtils;
 import com.linkedin.kafka.cruisecontrol.analyzer.BalancingConstraint;
 import com.linkedin.kafka.cruisecontrol.analyzer.goals.internals.BrokerAndSortedReplicas;
 import com.linkedin.kafka.cruisecontrol.common.TestConstants;
+import com.linkedin.kafka.cruisecontrol.config.BrokerCapacityInfo;
 import com.linkedin.kafka.cruisecontrol.config.KafkaCruiseControlConfig;
 import com.linkedin.kafka.cruisecontrol.model.Broker;
 import com.linkedin.kafka.cruisecontrol.model.ClusterModel;
@@ -27,6 +28,9 @@ import org.apache.kafka.common.TopicPartition;
 import org.junit.Test;
 
 import static com.linkedin.kafka.cruisecontrol.common.Resource.DISK;
+import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC0;
+import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC1;
+import static com.linkedin.kafka.cruisecontrol.common.TestConstants.TOPIC2;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
@@ -34,10 +38,6 @@ import static org.junit.Assert.assertEquals;
 
 
 public class KafkaAssignerDiskUsageDistributionGoalTest {
-  private static final String TOPIC0 = "topic0";
-  private static final String TOPIC1 = "topic1";
-  private static final String TOPIC2 = "topic2";
-
   private static final TopicPartition T0P0 = new TopicPartition(TOPIC0, 0);
   private static final TopicPartition T0P1 = new TopicPartition(TOPIC0, 1);
   private static final TopicPartition T0P2 = new TopicPartition(TOPIC0, 2);
@@ -224,12 +224,13 @@ public class KafkaAssignerDiskUsageDistributionGoalTest {
       clusterModel.createRack("r" + i);
     }
 
+    BrokerCapacityInfo commonBrokerCapacityInfo = new BrokerCapacityInfo(TestConstants.BROKER_CAPACITY);
     int i = 0;
     for (; i < 2; i++) {
-      clusterModel.createBroker("r0", "h" + i, i, TestConstants.BROKER_CAPACITY);
+      clusterModel.createBroker("r0", "h" + i, i, commonBrokerCapacityInfo);
     }
     for (int j = 1; j < numRacks; j++, i++) {
-      clusterModel.createBroker("r" + j, "h" + i, i, TestConstants.BROKER_CAPACITY);
+      clusterModel.createBroker("r" + j, "h" + i, i, commonBrokerCapacityInfo);
     }
 
     clusterModel.createReplica("r0", 0, T0P0, 0, true);

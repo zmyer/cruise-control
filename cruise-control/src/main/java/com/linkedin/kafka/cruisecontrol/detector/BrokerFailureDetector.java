@@ -33,10 +33,13 @@ import static java.util.stream.Collectors.toSet;
 
 /**
  * This class detects broker failures.
- *
  */
 public class BrokerFailureDetector {
   private static final Logger LOG = LoggerFactory.getLogger(BrokerFailureDetector.class);
+  // TODO: Make this configurable.
+  private static final boolean EXCLUDE_RECENTLY_DEMOTED_BROKERS = true;
+  // TODO: Make this configurable.
+  private static final boolean EXCLUDE_RECENTLY_REMOVED_BROKERS = true;
   private static final long MAX_METADATA_WAIT_MS = 60000L;
   private final KafkaCruiseControl _kafkaCruiseControl;
   private final String _failedBrokersZkPath;
@@ -46,6 +49,7 @@ public class BrokerFailureDetector {
   private final LoadMonitor _loadMonitor;
   private final Queue<Anomaly> _anomalies;
   private final Time _time;
+  private final boolean _allowCapacityEstimation;
 
   public BrokerFailureDetector(KafkaCruiseControlConfig config,
                                LoadMonitor loadMonitor,
@@ -63,6 +67,7 @@ public class BrokerFailureDetector {
     _anomalies = anomalies;
     _time = time;
     _kafkaCruiseControl = kafkaCruiseControl;
+    _allowCapacityEstimation = config.getBoolean(KafkaCruiseControlConfig.ANOMALY_DETECTION_ALLOW_CAPACITY_ESTIMATION_CONFIG);
   }
 
   void startDetection() {
@@ -153,7 +158,11 @@ public class BrokerFailureDetector {
   private void reportBrokerFailures() {
     if (!_failedBrokers.isEmpty()) {
       Map<Integer, Long> failedBrokers = new HashMap<>(_failedBrokers);
-      _anomalies.add(new BrokerFailures(_kafkaCruiseControl, failedBrokers));
+      _anomalies.add(new BrokerFailures(_kafkaCruiseControl,
+                                        failedBrokers,
+                                        _allowCapacityEstimation,
+                                        EXCLUDE_RECENTLY_DEMOTED_BROKERS,
+                                        EXCLUDE_RECENTLY_REMOVED_BROKERS));
     }
   }
 

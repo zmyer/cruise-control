@@ -37,9 +37,11 @@ public class MetricSampleAggregatorTest {
   private static final int NUM_WINDOWS = 20;
   private static final long WINDOW_MS = 1000L;
   private static final int MIN_SAMPLES_PER_WINDOW = 4;
-  private static final IntegerEntity ENTITY1 = new IntegerEntity("g1", 1234);
-  private static final IntegerEntity ENTITY2 = new IntegerEntity("g1", 5678);
-  private static final IntegerEntity ENTITY3 = new IntegerEntity("g2", 1234);
+  private static final String ENTITY_GROUP_1 = "g1";
+  private static final String ENTITY_GROUP_2 = "g2";
+  private static final IntegerEntity ENTITY1 = new IntegerEntity(ENTITY_GROUP_1, 1234);
+  private static final IntegerEntity ENTITY2 = new IntegerEntity(ENTITY_GROUP_1, 5678);
+  private static final IntegerEntity ENTITY3 = new IntegerEntity(ENTITY_GROUP_2, 1234);
   private final MetricDef _metricDef = CruiseControlUnitTestUtils.getMetricDef();
 
   @Test
@@ -108,6 +110,22 @@ public class MetricSampleAggregatorTest {
                                                         aggregator, ENTITY2, 1, WINDOW_MS, _metricDef);
     aggregator.completeness(-1, Long.MAX_VALUE, options);
     assertEquals(NUM_WINDOWS + 2, windowState.windowStates().get((long) 2).generation().intValue());
+    long initGeneration = aggregator.generation();
+    // Ensure that generation is not bumped up for group retains that remove no elements.
+    aggregator.retainEntityGroup(Collections.singleton(ENTITY_GROUP_1));
+    assertEquals(initGeneration, aggregator.generation().longValue());
+    // Ensure that generation is not bumped up for group removes that remove no elements.
+    aggregator.removeEntityGroup(Collections.emptySet());
+    assertEquals(initGeneration, aggregator.generation().longValue());
+    // Ensure that generation is not bumped up for entity removes that remove no elements.
+    aggregator.removeEntities(Collections.emptySet());
+    assertEquals(initGeneration, aggregator.generation().longValue());
+    // Ensure that generation is not bumped up for entity retains that remove no elements.
+    aggregator.retainEntities(new HashSet<>(Arrays.asList(ENTITY1, ENTITY2)));
+    assertEquals(initGeneration, aggregator.generation().longValue());
+    // Ensure that generation is bumped up for retains that remove elements.
+    aggregator.retainEntityGroup(Collections.emptySet());
+    assertEquals(initGeneration + 1, aggregator.generation().longValue());
   }
 
   @Test
@@ -157,6 +175,29 @@ public class MetricSampleAggregatorTest {
     assertEquals(NUM_WINDOWS - 2, availableWindows.size());
     for (int i = 0; i < NUM_WINDOWS - 2; i++) {
       assertEquals((i + 1) * WINDOW_MS, availableWindows.get(i).longValue());
+    }
+  }
+
+  @Test
+  public void testAddSamplesWithLargeInterval() {
+    MetricSampleAggregator<String, IntegerEntity> aggregator =
+        new MetricSampleAggregator<>(NUM_WINDOWS, WINDOW_MS, MIN_SAMPLES_PER_WINDOW,
+            0, _metricDef);
+    // Populate samples for time window indexed from 0 to NUM_WINDOWS to aggregator.
+    CruiseControlUnitTestUtils.populateSampleAggregator(NUM_WINDOWS + 1, MIN_SAMPLES_PER_WINDOW,
+        aggregator, ENTITY1, 0, WINDOW_MS,
+        _metricDef);
+
+    // Populate samples for time window index from 4 * NUM_WINDOWS to 5 * NUM_WINDOWS - 1 to aggregator.
+    CruiseControlUnitTestUtils.populateSampleAggregator(NUM_WINDOWS, MIN_SAMPLES_PER_WINDOW,
+        aggregator, ENTITY1, 4 * NUM_WINDOWS, WINDOW_MS,
+        _metricDef);
+    // If aggregator rolls out time window properly, time window indexed from 4 * NUM_WINDOW -1 to 5 * NUM_WINDOW -1 are
+    // currently in memory and time window indexed from 4 * NUM_WINDOW -1 to  5 * NUM_WINDOW - 2 should be returned from query.
+    List<Long> availableWindows = aggregator.availableWindows();
+    assertEquals(NUM_WINDOWS, availableWindows.size());
+    for (int i = 0; i < NUM_WINDOWS; i++) {
+      assertEquals((i + 4 * NUM_WINDOWS) * WINDOW_MS, availableWindows.get(i).longValue());
     }
   }
 
@@ -230,10 +271,11 @@ public class MetricSampleAggregatorTest {
                                  AggregationOptions.Granularity.ENTITY, true);
 
     MetricSampleCompleteness<String, IntegerEntity> completeness = aggregator.completeness(-1, Long.MAX_VALUE, options);
-    assertEquals(20, completeness.validWindowIndexes().size());
-    assertEquals(1, completeness.validEntities().size());
+    assertEquals(17, completeness.validWindowIndexes().size());
+    assertEquals(2, completeness.validEntities().size());
     assertTrue(completeness.validEntities().contains(ENTITY1));
-    assertTrue(completeness.validEntityGroups().isEmpty());
+    assertTrue(completeness.validEntities().contains(ENTITY3));
+    assertTrue(completeness.validEntityGroups().contains(ENTITY3.group()));
     assertCompletenessByWindowIndex(completeness);
   }
 
